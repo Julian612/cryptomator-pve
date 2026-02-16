@@ -1,67 +1,80 @@
 #!/usr/bin/env bash
-# install-cryptomator-hub.sh
+# cryptomator-hub-pve.sh
 #
-# Proxmox VE helper-artiges Install-Script für Cryptomator Hub in Debian 12 LXC (Docker Compose).
+# Proxmox VE helper-artiges Install-Script für Cryptomator Hub in Debian 12 LXC (Docker Compose)
+# Unterstützt:
+#  - Internal Keycloak: Postgres + Keycloak + Hub (Realm/Clients via realm.json Import)
+#  - External Keycloak: Postgres + Hub (Keycloak existiert extern, Objekte manuell erstellen)
 #
-# Unterstützte Varianten:
-#  A) "Internal Keycloak":  Postgres + Keycloak + Cryptomator Hub (alles im selben Compose-Stack)
-#  B) "External Keycloak":  Postgres + Cryptomator Hub (Keycloak existiert bereits extern)
+# Designziele:
+#  - Whiptail UI (Proxmox-Helper-Stil)
+#  - Defaults werden angezeigt und bei leerer Eingabe übernommen
+#  - Robustere Validierung (URLs, Images)
+#  - Template-Storage (vztmpl) wird abgefragt/ausgewählt (nicht hardcodiert "local")
 #
-# Was das Script macht:
-# - Fragt interaktiv alle relevanten Variablen ab (Defaults vorhanden)
-# - Erstellt einen Debian 12 LXC (unprivileged, nesting=1, keyctl=1)
-# - Installiert Docker + docker compose plugin im LXC
-# - Schreibt /opt/cryptomator-hub/{compose.yml,.env,data/...} im LXC
-# - Startet den Stack
-# - Gibt am Ende eine Zusammenfassung aus
+# Ausführung:
+#  - Auf dem Proxmox Host als root
 #
 # Sicherheit:
-# - Secrets werden in /opt/cryptomator-hub/.env im LXC abgelegt (chmod 600).
-# - Checke .env und data/ nie ins Git ein.
-#
-# Reverse Proxy:
-# - Standardmässig bindet das Script Ports nur auf 127.0.0.1 (für Reverse Proxy).
-# - Keycloak (intern): 127.0.0.1:8081
-# - Hub:               127.0.0.1:8082
-#
-# Lizenz: MIT (empfohlen für GitHub)
+#  - Secrets landen im LXC unter /opt/cryptomator-hub/.env (chmod 600). Nicht ins Git einchecken.
 
 set -euo pipefail
 
 ### ---------------------------
-### Helper functions
+### UI: Proxmox Helper Look & Feel
+### ---------------------------
+export NEWT_COLORS='
+root=white,blue
+window=black,lightgray
+border=black,lightgray
+textbox=black,lightgray
+button=white,blue
+actbutton=white,blue
+compactbutton=white,blue
+entry=black,lightgray
+label=black,lightgray
+listbox=black,lightgray
+actsellistbox=white,blue
+sellistbox=black,lightgray
+'
+
+### ---------------------------
+### Helper
 ### ---------------------------
 err() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || err "Fehlendes Kommando: $1"; }
 
-prompt() {
-  # prompt "Label" "default" -> echo value
-  local label="$1"
-  local def="${2:-}"
-  local val=""
-  if [[ -n "$def" ]]; then
-    read -r -p "$label [$def]: " val
-    echo "${val:-$def}"
-  else
-    read -r -p "$label: " val
-    echo "$val"
-  fi
+ensure_whiptail() {
+  if command -v whiptail >/dev/null 2>&1; then return 0; fi
+  echo "whiptail nicht gefunden. Installiere..."
+  apt-get update -y >/dev/null
+  apt-get install -y whiptail >/dev/null
 }
 
-prompt_bool() {
-  # prompt_bool "Label" "yes|no" -> echo yes/no
-  local label="$1"
-  local def="${2:-no}"
-  local val=""
-  read -r -p "$label (yes/no) [$def]: " val
-  val="${val:-$def}"
-  case "$val" in
-    y|Y|yes|YES) echo "yes" ;;
-    n|N|no|NO)   echo "no" ;;
-    *) echo "$def" ;;
-  esac
+# whiptail wrappers (cancel => exit)
+ui_msg() { whiptail --title "${1:-Info}" --msgbox "${2:-}" 12 80; }
+ui_yesno() { # returns 0=yes 1=no
+  whiptail --title "${1:-Frage}" --yesno "${2:-}" 12 80
+}
+ui_input() { # ui_input "title" "text" "default" -> stdout
+  local title="$1" text="$2" def="${3:-}"
+  local out
+  out="$(whiptail --title "$title" --inputbox "$text" 12 80 "$def" 3>&1 1>&2 2>&3)" || exit 1
+  # whiptail liefert "" wenn ENTER ohne Eingabe -> Default übernehmen
+  if [[ -z "$out" ]]; then
+    echo "$def"
+  else
+    echo "$out"
+  fi
+}
+ui_menu() { # ui_menu "title" "text" height width listheight items... -> stdout (tag)
+  local title="$1" text="$2" h="${3:-16}" w="${4:-80}" lh="${5:-8}"
+  shift 5
+  local out
+  out="$(whiptail --title "$title" --menu "$text" "$h" "$w" "$lh" "$@" 3>&1 1>&2 2>&3)" || exit 1
+  echo "$out"
 }
 
 rand_hex() { local n="${1:-24}"; openssl rand -hex "$n"; }
@@ -70,137 +83,182 @@ rand_b64() { local n="${1:-24}"; openssl rand -base64 "$n" | tr -d '\n'; }
 pct_exec() { local ctid="$1"; shift; pct exec "$ctid" -- bash -lc "$*"; }
 
 pct_push_str() {
-  local ctid="$1"
-  local path="$2"
-  local content="$3"
+  local ctid="$1" path="$2" content="$3" perms="${4:-0644}"
   local tmp
   tmp="$(mktemp)"
   printf "%s" "$content" >"$tmp"
-  pct push "$ctid" "$tmp" "$path" --perms 0644
+  pct push "$ctid" "$tmp" "$path" --perms "$perms"
   rm -f "$tmp"
 }
 
 uuid_any() {
-  if command -v uuidgen >/dev/null 2>&1; then
-    uuidgen
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen; else cat /proc/sys/kernel/random/uuid; fi
+}
+
+normalise_url() {
+  local u="$1"
+  if [[ "$u" != http*://* ]]; then
+    echo "https://${u}"
   else
-    cat /proc/sys/kernel/random/uuid
+    echo "$u"
   fi
+}
+
+validate_image() {
+  local v="$1" label="$2"
+  [[ "$v" == *:* ]] || err "$label muss Format image:tag haben (z.B. postgres:14-alpine). Eingabe: '$v'"
 }
 
 ### ---------------------------
 ### Preflight
 ### ---------------------------
+[[ "$(id -u)" -eq 0 ]] || err "Bitte als root auf dem Proxmox VE Host ausführen."
 need_cmd pveversion
 need_cmd pct
 need_cmd pveam
+need_cmd pvesm
 need_cmd openssl
 need_cmd awk
 need_cmd sed
 need_cmd grep
+ensure_whiptail
 
-[[ "$(id -u)" -eq 0 ]] || err "Bitte als root auf dem Proxmox VE Host ausführen."
-
-info "Cryptomator Hub Installer (PVE helper-artig) – Internal/External Keycloak"
+ui_msg "Cryptomator Hub Installer" "Dieses Script deployt Cryptomator Hub in einem Debian 12 LXC auf Proxmox VE.\n\nDu kannst Internal Keycloak oder External Keycloak wählen.\n\nAbbruch jederzeit mit ESC."
 
 ### ---------------------------
-### Collect variables (interactive)
+### Variante wählen
 ### ---------------------------
+MODE="$(ui_menu "Variante" "Welche Variante willst du deployen?" 14 80 5 \
+  "internal" "Internal Keycloak (Postgres + Keycloak + Hub)" \
+  "external" "External Keycloak (Postgres + Hub, Keycloak existiert extern)")"
 
-# Container basics
-CTID="$(prompt "CTID (numerisch)" "120")"
+USE_EXTERNAL_KC="no"
+[[ "$MODE" == "external" ]] && USE_EXTERNAL_KC="yes"
+
+### ---------------------------
+### Basis-Parameter (LXC)
+### ---------------------------
+CTID="$(ui_input "LXC" "CTID (numerisch)\n\nHinweis: muss frei sein." "120")"
 [[ "$CTID" =~ ^[0-9]+$ ]] || err "CTID muss numerisch sein."
+if pct status "$CTID" >/dev/null 2>&1; then
+  err "CTID $CTID existiert bereits. Bitte andere CTID wählen oder Container entfernen."
+fi
 
-HOSTNAME="$(prompt "LXC Hostname" "cryptomator-hub")"
-TZ="$(prompt "Zeitzone im LXC" "Europe/Zurich")"
+HOSTNAME="$(ui_input "LXC" "Hostname des LXC" "cryptomator-hub")"
+TZ="$(ui_input "LXC" "Zeitzone im LXC" "Europe/Zurich")"
 
-# Variant selection
-USE_EXTERNAL_KC="$(prompt_bool "Externen Keycloak verwenden (Keycloak nicht mitdeployen)?" "no")"
+CORES="$(ui_input "Ressourcen" "CPU Cores" "2")"
+RAM="$(ui_input "Ressourcen" "RAM (MB)" "2048")"
+DISK_GB="$(ui_input "Ressourcen" "Disk (GB) – RootFS Grösse" "16")"
+SWAP_MB="$(ui_input "Ressourcen" "Swap (MB)" "512")"
+[[ "$CORES" =~ ^[0-9]+$ && "$RAM" =~ ^[0-9]+$ && "$DISK_GB" =~ ^[0-9]+$ && "$SWAP_MB" =~ ^[0-9]+$ ]] || err "Ressourcenwerte müssen numerisch sein."
 
-# Resources
-CORES="$(prompt "CPU Cores" "2")"
-RAM="$(prompt "RAM (MB)" "2048")"
-DISK_GB="$(prompt "Disk (GB)" "16")"
-SWAP_MB="$(prompt "Swap (MB)" "512")"
+### ---------------------------
+### Storage Auswahl
+### ---------------------------
 
-# Storage/network
-STORAGE="$(prompt "Proxmox Storage für RootFS (z.B. local-lvm, local, zfs)" "local-lvm")"
-BRIDGE="$(prompt "Network Bridge" "vmbr0")"
-USE_DHCP="$(prompt_bool "Netzwerk via DHCP?" "yes")"
+# RootFS Storage (wo der Container liegt)
+# -> wir bieten alle storages an (user weiss was er will), Default local-lvm
+STORAGE_ROOTFS="$(ui_input "Storage" "Proxmox Storage für RootFS (z.B. local-lvm, zfs, SSDStorage)" "local-lvm")"
+
+# Template Storage (vztmpl) – wir versuchen automatisch passende Storages zu finden und als Menu anzubieten
+mapfile -t VZT_STORAGES < <(pvesm status --content vztmpl 2>/dev/null | awk 'NR>1{print $1}' | sort -u)
+if [[ "${#VZT_STORAGES[@]}" -eq 0 ]]; then
+  # Fallback: user input
+  TEMPLATE_STORAGE="$(ui_input "Templates" "Storage für LXC Templates (Content: vztmpl)\n\nHinweis: Oft 'local'." "local")"
+else
+  # build whiptail menu items
+  MENU_ITEMS=()
+  for s in "${VZT_STORAGES[@]}"; do MENU_ITEMS+=("$s" "Storage mit vztmpl"); done
+  TEMPLATE_STORAGE="$(ui_menu "Templates" "Wähle Storage für LXC Templates (vztmpl)" 14 80 6 "${MENU_ITEMS[@]}")"
+fi
+
+### ---------------------------
+### Netzwerk
+### ---------------------------
+BRIDGE="$(ui_input "Netzwerk" "Network Bridge (z.B. vmbr0)" "vmbr0")"
+if ui_yesno "Netzwerk" "Netzwerk via DHCP verwenden?"; then
+  USE_DHCP="yes"
+else
+  USE_DHCP="no"
+fi
 
 IP_CIDR=""
 GATEWAY=""
 DNS_SERVER=""
 if [[ "$USE_DHCP" == "no" ]]; then
-  IP_CIDR="$(prompt "Statische IP inkl. CIDR (z.B. 192.168.1.50/24)" "")"
-  GATEWAY="$(prompt "Gateway (z.B. 192.168.1.1)" "")"
-  DNS_SERVER="$(prompt "DNS Server (z.B. 1.1.1.1)" "1.1.1.1")"
+  IP_CIDR="$(ui_input "Netzwerk" "Statische IP inkl. CIDR (z.B. 192.168.1.50/24)" "")"
+  GATEWAY="$(ui_input "Netzwerk" "Gateway (z.B. 192.168.1.1)" "")"
+  DNS_SERVER="$(ui_input "Netzwerk" "DNS Server (z.B. 1.1.1.1)" "1.1.1.1")"
+  [[ -n "$IP_CIDR" && -n "$GATEWAY" ]] || err "Für statische IP müssen IP_CIDR und GATEWAY gesetzt sein."
 fi
 
-# Public URLs (für Redirects/Issuer/Proxy-Konfig)
-HUB_PUBLIC_BASE="$(prompt "Hub Public Base URL (z.B. https://hub.example.tld)" "https://hub.example.tld")"
-KC_PUBLIC_BASE="$(prompt "Keycloak Public Base URL (z.B. https://auth.example.tld oder https://example.tld/kc)" "https://auth.example.tld")"
+### ---------------------------
+### Public URLs / Ports / Images
+### ---------------------------
+HUB_PUBLIC_BASE="$(ui_input "URLs" "Hub Public Base URL\n\nBeispiel: https://cryptomator.example.tld" "https://cryptomator.example.tld")"
+KC_PUBLIC_BASE="$(ui_input "URLs" "Keycloak Public Base URL\n\nBeispiel: https://auth.example.tld oder https://example.tld/kc" "https://auth.example.tld")"
+HUB_PUBLIC_BASE="$(normalise_url "$HUB_PUBLIC_BASE")"
+KC_PUBLIC_BASE="$(normalise_url "$KC_PUBLIC_BASE")"
 
-# Host-local bindings
-KC_BIND_PORT="$(prompt "Keycloak bind port (host-local, nur relevant bei internem Keycloak)" "8081")"
-HUB_BIND_PORT="$(prompt "Hub bind port (host-local)" "8082")"
+KC_BIND_PORT="8081"
+if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
+  KC_BIND_PORT="$(ui_input "Ports" "Keycloak bind port (host-local)\n\nReverse Proxy: forwarded to this port." "8081")"
+fi
+HUB_BIND_PORT="$(ui_input "Ports" "Hub bind port (host-local)\n\nReverse Proxy: forwarded to this port." "8082")"
 
-BIND_PUBLIC="$(prompt_bool "Ports öffentlich binden (0.0.0.0) statt nur localhost?" "no")"
-if [[ "$BIND_PUBLIC" == "yes" ]]; then
+if ui_yesno "Ports" "Ports öffentlich binden (0.0.0.0) statt nur localhost?\n\nEmpfehlung: Nein (Reverse Proxy verwenden)."; then
   BIND_IP="0.0.0.0"
 else
   BIND_IP="127.0.0.1"
 fi
 
-# Images
-POSTGRES_IMAGE="$(prompt "Postgres Image" "postgres:14-alpine")"
-HUB_IMAGE="$(prompt "Hub Image" "ghcr.io/cryptomator/hub:stable")"
-KEYCLOAK_IMAGE_DEFAULT="ghcr.io/cryptomator/keycloak:26.5.3"
-KEYCLOAK_IMAGE="$KEYCLOAK_IMAGE_DEFAULT"
+POSTGRES_IMAGE="$(ui_input "Images" "Postgres Image" "postgres:14-alpine")"
+HUB_IMAGE="$(ui_input "Images" "Hub Image" "ghcr.io/cryptomator/hub:stable")"
+validate_image "$POSTGRES_IMAGE" "Postgres Image"
+validate_image "$HUB_IMAGE" "Hub Image"
+
+KEYCLOAK_IMAGE="ghcr.io/cryptomator/keycloak:26.5.3"
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
-  KEYCLOAK_IMAGE="$(prompt "Keycloak Image" "$KEYCLOAK_IMAGE_DEFAULT")"
+  KEYCLOAK_IMAGE="$(ui_input "Images" "Keycloak Image" "ghcr.io/cryptomator/keycloak:26.5.3")"
+  validate_image "$KEYCLOAK_IMAGE" "Keycloak Image"
 fi
 
-# Keycloak/Realm parameters
-EXTERNAL_KC_REALM="cryptomator"
+### ---------------------------
+### OIDC / Clients / Redirects
+### ---------------------------
+# Hub redirect URI default
+HUB_REDIRECT_URI_DEFAULT="${HUB_PUBLIC_BASE%/}/*"
+HUB_REDIRECT_URI="$(ui_input "OIDC" "Hub Redirect URI (Keycloak client: cryptomatorhub)\n\nBeispiel: ${HUB_REDIRECT_URI_DEFAULT}" "$HUB_REDIRECT_URI_DEFAULT")"
+
+HUB_OIDC_CLIENT_ID="$(ui_input "OIDC" "OIDC Client ID (Hub)" "cryptomatorhub")"
+HUB_SYSTEM_CLIENT_ID="$(ui_input "OIDC" "System Client ID (Keycloak)" "cryptomatorhub-system")"
+
 KC_RELATIVE_PATH="/kc"
 
-# Redirect URI for hub client
-HUB_REDIRECT_URI_DEFAULT="${HUB_PUBLIC_BASE%/}/*"
-HUB_REDIRECT_URI="$(prompt "Hub Redirect URI (Keycloak client cryptomatorhub), z.B. https://hub.example.tld/*" "$HUB_REDIRECT_URI_DEFAULT")"
-
-# Hub OIDC client id
-HUB_OIDC_CLIENT_ID="$(prompt "OIDC Client ID (Hub)" "cryptomatorhub")"
-
-# System client (used by Hub to manage users/groups)
-HUB_SYSTEM_CLIENT_ID="$(prompt "System Client ID (Keycloak)" "cryptomatorhub-system")"
-
-# External Keycloak specific
-KC_INTERNAL_URL="${KC_PUBLIC_BASE%/}"  # URL reachable from Hub container
+EXTERNAL_KC_REALM="cryptomator"
+KC_INTERNAL_URL="${KC_PUBLIC_BASE%/}"
 EXTERNAL_KC_ISSUER=""
 EXTERNAL_KC_AUTH_SERVER_URL=""
-
 HUB_SYSTEM_CLIENT_SECRET=""
+
 REALM_ADMIN_USER="admin"
 REALM_ADMIN_PASSWORD=""
 REALM_ADMIN_TEMP="true"
 
 if [[ "$USE_EXTERNAL_KC" == "yes" ]]; then
-  EXTERNAL_KC_REALM="$(prompt "Externer Keycloak Realm" "cryptomator")"
-  KC_INTERNAL_URL="$(prompt "Keycloak interne URL (vom Hub-Container erreichbar). Oft identisch zur Public URL" "${KC_PUBLIC_BASE%/}")"
+  EXTERNAL_KC_REALM="$(ui_input "External Keycloak" "Realm Name im externen Keycloak" "cryptomator")"
+  KC_INTERNAL_URL="$(ui_input "External Keycloak" "Keycloak interne URL (vom Hub-Container erreichbar)\n\nOft identisch zur Public URL." "${KC_PUBLIC_BASE%/}")"
   EXTERNAL_KC_ISSUER_DEFAULT="${KC_PUBLIC_BASE%/}/realms/${EXTERNAL_KC_REALM}"
-  EXTERNAL_KC_ISSUER="$(prompt "OIDC Issuer (z.B. https://auth.example.tld/realms/cryptomator)" "$EXTERNAL_KC_ISSUER_DEFAULT")"
-  EXTERNAL_KC_AUTH_SERVER_URL="$(prompt "OIDC Auth Server URL (Hub QUARKUS_OIDC_AUTH_SERVER_URL). Oft identisch zum Issuer" "$EXTERNAL_KC_ISSUER")"
-  HUB_SYSTEM_CLIENT_SECRET="$(prompt "System Client Secret (vom externen Keycloak)" "")"
+  EXTERNAL_KC_ISSUER="$(ui_input "External Keycloak" "OIDC Issuer\n\nBeispiel: ${EXTERNAL_KC_ISSUER_DEFAULT}" "$EXTERNAL_KC_ISSUER_DEFAULT")"
+  EXTERNAL_KC_AUTH_SERVER_URL="$(ui_input "External Keycloak" "OIDC Auth Server URL (Hub QUARKUS_OIDC_AUTH_SERVER_URL)\n\nOft identisch zum Issuer." "$EXTERNAL_KC_ISSUER")"
+  HUB_SYSTEM_CLIENT_SECRET="$(ui_input "External Keycloak" "System Client Secret (aus externem Keycloak)\n\nWichtig: nicht leer." "")"
   [[ -n "$HUB_SYSTEM_CLIENT_SECRET" ]] || err "System Client Secret darf nicht leer sein (External Keycloak)."
 else
-  KC_RELATIVE_PATH="$(prompt "Keycloak Relative Path" "/kc")"
+  KC_RELATIVE_PATH="$(ui_input "Keycloak" "Keycloak Relative Path" "/kc")"
 
-  # Realm bootstrap admin
-  REALM_ADMIN_USER="$(prompt "Initialer Realm-Admin Username (cryptomator realm)" "admin")"
-  REALM_ADMIN_PASSWORD="$(rand_b64 18)"
-  REALM_ADMIN_TEMP_Q="$(prompt_bool "Realm-Admin Passwort bei erstem Login erzwingen (temporary)?" "yes")"
-  if [[ "$REALM_ADMIN_TEMP_Q" == "yes" ]]; then
+  REALM_ADMIN_USER="$(ui_input "Keycloak" "Initialer Realm-Admin Username (cryptomator realm)" "admin")"
+  if ui_yesno "Keycloak" "Realm-Admin Passwort bei erstem Login erzwingen (temporary)?"; then
     REALM_ADMIN_TEMP="true"
   else
     REALM_ADMIN_TEMP="false"
@@ -208,48 +266,34 @@ else
 fi
 
 ### ---------------------------
-### Validate
-### ---------------------------
-if pct status "$CTID" >/dev/null 2>&1; then
-  err "CTID $CTID existiert bereits. Bitte andere CTID wählen oder Container entfernen."
-fi
-
-[[ "$CORES" =~ ^[0-9]+$ ]] || err "CORES muss numerisch sein."
-[[ "$RAM" =~ ^[0-9]+$ ]] || err "RAM muss numerisch sein."
-[[ "$DISK_GB" =~ ^[0-9]+$ ]] || err "DISK_GB muss numerisch sein."
-[[ "$SWAP_MB" =~ ^[0-9]+$ ]] || err "SWAP_MB muss numerisch sein."
-
-### ---------------------------
-### Download LXC template if needed
+### Template prüfen/downloaden
 ### ---------------------------
 TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
 
-info "Prüfe LXC Template: $TEMPLATE"
-if ! pveam list local | awk '{print $1}' | grep -qx "$TEMPLATE"; then
+info "Prüfe LXC Template: $TEMPLATE auf Storage: $TEMPLATE_STORAGE"
+if ! pveam list "$TEMPLATE_STORAGE" | awk '{print $1}' | grep -qx "$TEMPLATE"; then
   info "Template nicht vorhanden. Lade herunter..."
   pveam update >/dev/null
-  pveam download local "$TEMPLATE"
+  pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
 fi
 
 ### ---------------------------
-### Create LXC
+### LXC erstellen
 ### ---------------------------
-info "Erstelle LXC CT $CTID ($HOSTNAME)"
-
 NET_CONF="name=eth0,bridge=${BRIDGE},firewall=1"
 if [[ "$USE_DHCP" == "yes" ]]; then
   NET_CONF="${NET_CONF},ip=dhcp"
 else
-  [[ -n "$IP_CIDR" && -n "$GATEWAY" ]] || err "Für statische IP müssen IP_CIDR und GATEWAY gesetzt sein."
   NET_CONF="${NET_CONF},ip=${IP_CIDR},gw=${GATEWAY}"
 fi
 
-pct create "$CTID" "local:vztmpl/${TEMPLATE}" \
+info "Erstelle LXC CT $CTID ($HOSTNAME)"
+pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
   --hostname "$HOSTNAME" \
   --cores "$CORES" \
   --memory "$RAM" \
   --swap "$SWAP_MB" \
-  --rootfs "${STORAGE}:${DISK_GB}" \
+  --rootfs "${STORAGE_ROOTFS}:${DISK_GB}" \
   --net0 "$NET_CONF" \
   --features "nesting=1,keyctl=1" \
   --unprivileged 1 \
@@ -263,14 +307,12 @@ fi
 
 info "Starte LXC CT $CTID"
 pct start "$CTID"
-info "Warte kurz auf Boot..."
 sleep 5
 
 ### ---------------------------
-### Install Docker inside LXC
+### Docker im LXC installieren
 ### ---------------------------
 info "Installiere Docker + Compose im LXC"
-
 pct_exec "$CTID" "apt-get update"
 pct_exec "$CTID" "apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https"
 
@@ -283,7 +325,7 @@ pct_exec "$CTID" "apt-get install -y docker-ce docker-ce-cli containerd.io docke
 pct_exec "$CTID" "systemctl enable --now docker"
 
 ### ---------------------------
-### Generate secrets and config
+### Konfiguration erzeugen
 ### ---------------------------
 info "Erzeuge Secrets und Konfiguration"
 
@@ -300,22 +342,18 @@ pct_exec "$CTID" "chmod 700 '${DATA_DIR}' || true"
 POSTGRES_PASSWORD="$(rand_hex 24)"
 HUB_DB_PASSWORD="$(rand_hex 24)"
 
-# Internal Keycloak secrets
 KC_DB_PASSWORD=""
 KEYCLOAK_ADMIN_PASSWORD=""
-HUB_SYSTEM_CLIENT_SECRET_INTERNAL=""
-REALM_ID=""
-
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
   pct_exec "$CTID" "mkdir -p '${KC_IMPORT_DIR}'"
   KC_DB_PASSWORD="$(rand_hex 24)"
   KEYCLOAK_ADMIN_PASSWORD="$(rand_b64 24)"
-  HUB_SYSTEM_CLIENT_SECRET_INTERNAL="$(rand_hex 24)"
-  HUB_SYSTEM_CLIENT_SECRET="$HUB_SYSTEM_CLIENT_SECRET_INTERNAL"
-  REALM_ID="$(uuid_any)"
+  # System client secret wird in internal erzeugt
+  HUB_SYSTEM_CLIENT_SECRET="$(rand_hex 24)"
+  REALM_ADMIN_PASSWORD="$(rand_b64 18)"
 fi
 
-# initdb.sql (postgres init script)
+# initdb.sql
 if [[ "$USE_EXTERNAL_KC" == "yes" ]]; then
   INITDB_SQL=$(cat <<EOF
 CREATE USER hub WITH ENCRYPTED PASSWORD '${HUB_DB_PASSWORD}';
@@ -336,17 +374,17 @@ EOF
 )
 fi
 
-# realm.json only for internal Keycloak
+# realm.json (nur internal)
 REALM_JSON=""
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
-  # requiredActions depends on temporary setting
+  REALM_ID="$(uuid_any)"
+  HUB_PUBLIC_BASE_NOSLASH="${HUB_PUBLIC_BASE%/}"
+
   if [[ "$REALM_ADMIN_TEMP" == "true" ]]; then
     REQUIRED_ACTIONS='["UPDATE_PASSWORD"]'
   else
     REQUIRED_ACTIONS='[]'
   fi
-
-  HUB_PUBLIC_BASE_NOSLASH="${HUB_PUBLIC_BASE%/}"
 
   REALM_JSON=$(cat <<EOF
 {
@@ -405,33 +443,7 @@ if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
       "bearerOnly": false,
       "frontchannelLogout": false,
       "protocol": "openid-connect",
-      "attributes": { "pkce.code.challenge.method": "S256" },
-      "protocolMappers": [
-        {
-          "name": "realm roles",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-usermodel-realm-role-mapper",
-          "consentRequired": false,
-          "config": {
-            "access.token.claim": "true",
-            "claim.name": "realm_access.roles",
-            "jsonType.label": "String",
-            "multivalued": "true"
-          }
-        },
-        {
-          "name": "client roles",
-          "protocol": "openid-connect",
-          "protocolMapper": "oidc-usermodel-client-role-mapper",
-          "consentRequired": false,
-          "config": {
-            "access.token.claim": "true",
-            "claim.name": "resource_access.\$\${client_id}.roles",
-            "jsonType.label": "String",
-            "multivalued": "true"
-          }
-        }
-      ]
+      "attributes": { "pkce.code.challenge.method": "S256" }
     },
     {
       "clientId": "cryptomator",
@@ -469,58 +481,50 @@ EOF
 )
 fi
 
-# .env content
+# .env
 ENV_CONTENT=$(cat <<EOF
 # Cryptomator Hub deployment (.env)
 # WICHTIG: Diese Datei enthält Secrets. Nicht in Git einchecken.
 
-# Variant
 USE_EXTERNAL_KC=${USE_EXTERNAL_KC}
 
-# Images
 POSTGRES_IMAGE=${POSTGRES_IMAGE}
 HUB_IMAGE=${HUB_IMAGE}
 KEYCLOAK_IMAGE=${KEYCLOAK_IMAGE}
 
-# Bindings
 BIND_IP=${BIND_IP}
 KC_BIND_PORT=${KC_BIND_PORT}
 HUB_BIND_PORT=${HUB_BIND_PORT}
 
-# Public URLs
 HUB_PUBLIC_BASE=${HUB_PUBLIC_BASE%/}
 KC_PUBLIC_BASE=${KC_PUBLIC_BASE%/}
 KC_RELATIVE_PATH=${KC_RELATIVE_PATH}
 
-# Database
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 HUB_DB_PASSWORD=${HUB_DB_PASSWORD}
 KC_DB_PASSWORD=${KC_DB_PASSWORD}
 
-# Hub OIDC
 HUB_OIDC_CLIENT_ID=${HUB_OIDC_CLIENT_ID}
 HUB_SYSTEM_CLIENT_ID=${HUB_SYSTEM_CLIENT_ID}
 HUB_SYSTEM_CLIENT_SECRET=${HUB_SYSTEM_CLIENT_SECRET}
 
-# External Keycloak (nur wenn USE_EXTERNAL_KC=yes)
 EXTERNAL_KC_REALM=${EXTERNAL_KC_REALM}
 KC_INTERNAL_URL=${KC_INTERNAL_URL}
 EXTERNAL_KC_ISSUER=${EXTERNAL_KC_ISSUER}
 EXTERNAL_KC_AUTH_SERVER_URL=${EXTERNAL_KC_AUTH_SERVER_URL}
 
-# Redirect URI for hub client
 HUB_REDIRECT_URI=${HUB_REDIRECT_URI}
 
-# Internal Keycloak bootstrap (nur wenn USE_EXTERNAL_KC=no)
 KEYCLOAK_ADMIN_USER=admin
 KEYCLOAK_ADMIN_PASSWORD=${KEYCLOAK_ADMIN_PASSWORD}
+
 REALM_ADMIN_USER=${REALM_ADMIN_USER}
 REALM_ADMIN_PASSWORD=${REALM_ADMIN_PASSWORD}
 REALM_ADMIN_TEMPORARY=${REALM_ADMIN_TEMP}
 EOF
 )
 
-# compose.yml content (two variants)
+# compose.yml (2 Varianten)
 if [[ "$USE_EXTERNAL_KC" == "yes" ]]; then
   COMPOSE_CONTENT=$(cat <<EOF
 services:
@@ -543,16 +547,12 @@ services:
     restart: unless-stopped
     environment:
       HUB_PUBLIC_ROOT_PATH: /
-      # Public URL des Keycloak (Issuer/Browser)
       HUB_KEYCLOAK_PUBLIC_URL: \${KC_PUBLIC_BASE}
-      # Interne URL (vom Hub-Container erreichbar)
       HUB_KEYCLOAK_LOCAL_URL: \${KC_INTERNAL_URL}
       HUB_KEYCLOAK_REALM: \${EXTERNAL_KC_REALM}
       HUB_KEYCLOAK_SYSTEM_CLIENT_ID: \${HUB_SYSTEM_CLIENT_ID}
       HUB_KEYCLOAK_SYSTEM_CLIENT_SECRET: \${HUB_SYSTEM_CLIENT_SECRET}
       HUB_KEYCLOAK_SYNCER_PERIOD: 5m
-
-      # Cryptomator App client id bleibt "cryptomator" (wie in offiziellen Defaults)
       HUB_KEYCLOAK_OIDC_CRYPTOMATOR_CLIENT_ID: cryptomator
 
       QUARKUS_OIDC_AUTH_SERVER_URL: \${EXTERNAL_KC_AUTH_SERVER_URL}
@@ -599,6 +599,7 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded
       KC_HTTP_RELATIVE_PATH: \${KC_RELATIVE_PATH}
+      # Hinweis: Cryptomator nutzt häufig URL inkl. /kc. Wenn du das änderst, entferne --optimized.
       KC_HOSTNAME: \${KC_PUBLIC_BASE}
 
   hub:
@@ -632,78 +633,70 @@ EOF
 fi
 
 ### ---------------------------
-### Push files into LXC
+### Dateien ins LXC schreiben
 ### ---------------------------
-info "Schreibe Dateien in den LXC: ${APP_DIR}"
+info "Schreibe Dateien in den LXC"
 
-# Write initdb.sql
-pct_push_str "$CTID" "${DB_INIT_DIR}/initdb.sql" "$INITDB_SQL"
-pct_exec "$CTID" "chmod 600 '${DB_INIT_DIR}/initdb.sql'"
+pct_exec "$CTID" "mkdir -p '${APP_DIR}' '${DB_INIT_DIR}'"
+pct_push_str "$CTID" "${DB_INIT_DIR}/initdb.sql" "$INITDB_SQL" 0600
 
-# Write realm.json if internal
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
-  pct_push_str "$CTID" "${KC_IMPORT_DIR}/realm.json" "$REALM_JSON"
-  pct_exec "$CTID" "chmod 600 '${KC_IMPORT_DIR}/realm.json'"
+  pct_exec "$CTID" "mkdir -p '${KC_IMPORT_DIR}'"
+  pct_push_str "$CTID" "${KC_IMPORT_DIR}/realm.json" "$REALM_JSON" 0600
 fi
 
-# Write compose and env
-pct_push_str "$CTID" "${APP_DIR}/compose.yml" "$COMPOSE_CONTENT"
-pct_push_str "$CTID" "${APP_DIR}/.env" "$ENV_CONTENT"
-pct_exec "$CTID" "chmod 644 '${APP_DIR}/compose.yml'"
-pct_exec "$CTID" "chmod 600 '${APP_DIR}/.env'"
+pct_push_str "$CTID" "${APP_DIR}/compose.yml" "$COMPOSE_CONTENT" 0644
+pct_push_str "$CTID" "${APP_DIR}/.env" "$ENV_CONTENT" 0600
 
 ### ---------------------------
-### Start stack
+### Start
 ### ---------------------------
-info "Starte Container (docker compose up -d)"
+info "Starte Stack (docker compose up -d)"
 pct_exec "$CTID" "cd '${APP_DIR}' && docker compose --env-file .env -f compose.yml up -d"
 
 ### ---------------------------
-### Summary
+### Summary (UI + stdout)
 ### ---------------------------
-echo ""
-echo "===== Zusammenfassung ====="
-echo "LXC CTID:                 $CTID"
-echo "LXC Hostname:             $HOSTNAME"
-echo "Installationspfad (LXC):  $APP_DIR"
-echo "Variante:                 $( [[ "$USE_EXTERNAL_KC" == "yes" ]] && echo "External Keycloak" || echo "Internal Keycloak" )"
-echo ""
-echo "Hub (lokal):              http://${BIND_IP}:${HUB_BIND_PORT}/"
+SUMMARY="Installation abgeschlossen.
+
+CTID:            ${CTID}
+Hostname:        ${HOSTNAME}
+Variante:        $( [[ "$USE_EXTERNAL_KC" == "yes" ]] && echo "External Keycloak" || echo "Internal Keycloak" )
+
+Hub lokal:       http://${BIND_IP}:${HUB_BIND_PORT}/
+Hub Public:      ${HUB_PUBLIC_BASE%/}
+
+Keycloak Public: ${KC_PUBLIC_BASE%/}
+"
+
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
-  echo "Keycloak (lokal):          http://${BIND_IP}:${KC_BIND_PORT}${KC_RELATIVE_PATH}"
-fi
-echo ""
-echo "Hub Public Base:          ${HUB_PUBLIC_BASE%/}"
-echo "Keycloak Public Base:     ${KC_PUBLIC_BASE%/}"
-echo ""
+  SUMMARY+="
+Keycloak lokal:  http://${BIND_IP}:${KC_BIND_PORT}${KC_RELATIVE_PATH}
 
-if [[ "$USE_EXTERNAL_KC" == "yes" ]]; then
-  echo "External Keycloak Realm:  ${EXTERNAL_KC_REALM}"
-  echo "OIDC Issuer:              ${EXTERNAL_KC_ISSUER}"
-  echo "OIDC Auth Server URL:     ${EXTERNAL_KC_AUTH_SERVER_URL}"
-  echo ""
-  echo "Wichtig (External):"
-  echo "- Stelle sicher, dass im Keycloak folgende Objekte existieren:"
-  echo "  - Realm:                 ${EXTERNAL_KC_REALM}"
-  echo "  - Client (Hub):          ${HUB_OIDC_CLIENT_ID} (public client, Redirect URI: ${HUB_REDIRECT_URI})"
-  echo "  - Client (System):       ${HUB_SYSTEM_CLIENT_ID} (confidential, secret: <dein Secret>)"
-  echo "  - Client (Cryptomator):  cryptomator (redirectUris: mobile/localhost wie üblich)"
+Keycloak Admin (container env):
+  user: admin
+  pass: ${KEYCLOAK_ADMIN_PASSWORD}
+
+Realm Admin (cryptomator):
+  user: ${REALM_ADMIN_USER}
+  pass: ${REALM_ADMIN_PASSWORD}
+  temporary: ${REALM_ADMIN_TEMP}
+
+Hinweis:
+- Wenn du KC_PUBLIC_BASE oder KC_RELATIVE_PATH später änderst, entferne '--optimized' im Keycloak command.
+"
 else
-  echo "Keycloak Admin (container env):"
-  echo "  User:                   admin"
-  echo "  Password:               ${KEYCLOAK_ADMIN_PASSWORD}"
-  echo ""
-  echo "Realm Admin (cryptomator realm):"
-  echo "  User:                   ${REALM_ADMIN_USER}"
-  echo "  Password:               ${REALM_ADMIN_PASSWORD}"
-  echo "  Temporary Password:     ${REALM_ADMIN_TEMP}"
-  echo ""
-  echo "Wichtig (Internal):"
-  echo "- Wenn du KC_PUBLIC_BASE oder KC_RELATIVE_PATH später änderst, entferne '--optimized' aus dem Keycloak command,"
-  echo "  sonst startet Keycloak nicht."
+  SUMMARY+="
+External Keycloak:
+  realm:  ${EXTERNAL_KC_REALM}
+  issuer: ${EXTERNAL_KC_ISSUER}
+
+Hinweis:
+- Realm/Clients im externen Keycloak müssen korrekt existieren (cryptomatorhub, cryptomatorhub-system, cryptomator).
+"
 fi
 
-echo ""
-echo "Logs (im LXC):"
-echo "  cd ${APP_DIR} && docker compose --env-file .env -f compose.yml logs -f"
-echo "==========================="
+ui_msg "Fertig" "$SUMMARY"
+echo "$SUMMARY"
+echo "Logs im LXC:"
+echo "  pct exec ${CTID} -- bash -lc 'cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml logs -f'"
