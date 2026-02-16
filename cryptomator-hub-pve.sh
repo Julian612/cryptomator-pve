@@ -16,12 +16,10 @@
 #  - Template-Storage (vztmpl) wird ausgewählt/validiert
 #  - URLs werden normalisiert (fehlendes https:// wird ergänzt)
 #  - Images werden validiert (image:tag)
+#  - DNS/Netzwerk wird im LXC geprüft; optionaler DNS-Override auch bei DHCP möglich
 #
 # Ausführung:
 #  - Auf dem Proxmox Host als root
-#
-# Sicherheit:
-#  - Secrets werden im LXC unter /opt/cryptomator-hub/.env gespeichert (chmod 600). Nicht ins Git einchecken.
 
 set -euo pipefail
 
@@ -58,13 +56,13 @@ ensure_whiptail() {
   apt-get install -y whiptail >/dev/null
 }
 
-ui_msg() { whiptail --title "${1:-Info}" --msgbox "${2:-}" 12 80; }
-ui_yesno() { whiptail --title "${1:-Frage}" --yesno "${2:-}" 12 80; } # 0=yes 1=no
+ui_msg() { whiptail --title "${1:-Info}" --msgbox "${2:-}" 14 80; }
+ui_yesno() { whiptail --title "${1:-Frage}" --yesno "${2:-}" 14 80; } # 0=yes 1=no
 
 ui_input() { # ui_input "title" "text" "default" -> stdout ; ENTER => default
   local title="$1" text="$2" def="${3:-}"
   local out
-  out="$(whiptail --title "$title" --inputbox "$text" 12 80 "$def" 3>&1 1>&2 2>&3)" || exit 1
+  out="$(whiptail --title "$title" --inputbox "$text" 14 80 "$def" 3>&1 1>&2 2>&3)" || exit 1
   if [[ -z "$out" ]]; then
     echo "$def"
   else
@@ -108,6 +106,21 @@ normalise_url() {
 validate_image() {
   local v="$1" label="$2"
   [[ "$v" == *:* ]] || err "$label muss Format image:tag haben (z.B. postgres:14-alpine). Eingabe: '$v'"
+}
+
+# Netz/DNS Checks im Container (ohne zusätzliche Tools)
+lxc_net_check() {
+  local ctid="$1"
+  # IP-Connectivity (ICMP kann geblockt sein; ist aber oft ok). Wir versuchen beides.
+  pct_exec "$ctid" "ip r >/dev/null 2>&1" || return 1
+
+  # DNS Check via getent (glibc) – zuverlässig ohne ping DNS
+  pct_exec "$ctid" "getent ahosts deb.debian.org >/dev/null 2>&1" && return 0
+
+  # Fallback: ping auf Namen (wenn getent fehlt, sehr selten)
+  pct_exec "$ctid" "ping -c 1 -W 2 deb.debian.org >/dev/null 2>&1" && return 0
+
+  return 1
 }
 
 ### ---------------------------
@@ -181,11 +194,16 @@ fi
 IP_CIDR=""
 GATEWAY=""
 DNS_SERVER=""
+DNS_OVERRIDE=""
+
 if [[ "$USE_DHCP" == "no" ]]; then
   IP_CIDR="$(ui_input "Netzwerk" "Statische IP inkl. CIDR (z.B. 192.168.1.50/24)" "")"
   GATEWAY="$(ui_input "Netzwerk" "Gateway (z.B. 192.168.1.1)" "")"
   DNS_SERVER="$(ui_input "Netzwerk" "DNS Server (z.B. 1.1.1.1)" "1.1.1.1")"
   [[ -n "$IP_CIDR" && -n "$GATEWAY" ]] || err "Für statische IP müssen IP_CIDR und GATEWAY gesetzt sein."
+else
+  # DHCP: optionaler Override, weil DHCP/IPv6/Resolver in LXCs manchmal nicht zuverlässig ist
+  DNS_OVERRIDE="$(ui_input "Netzwerk" "DNS Override (optional)\n\nLeer lassen = DHCP/DHCPv6 verwenden.\nBei Problemen: z.B. 1.1.1.1 oder 9.9.9.9" "")"
 fi
 
 ### ---------------------------
@@ -309,13 +327,42 @@ pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
   --ostype debian \
   --timezone "$TZ"
 
+# DNS setzen:
+# - statisch: DNS_SERVER wird gesetzt
+# - DHCP: falls DNS_OVERRIDE angegeben, wird der Container-Resolver explizit gesetzt (um "Temporary failure resolving" zu vermeiden)
 if [[ "$USE_DHCP" == "no" ]]; then
   pct set "$CTID" --nameserver "$DNS_SERVER"
+else
+  if [[ -n "$DNS_OVERRIDE" ]]; then
+    pct set "$CTID" --nameserver "$DNS_OVERRIDE"
+  fi
 fi
 
 info "Starte LXC CT $CTID"
 pct start "$CTID"
-sleep 5
+sleep 6
+
+# DNS/Netzwerk check: Wenn DNS kaputt ist, bieten wir eine automatische Korrektur (DNS setzen) an.
+if ! lxc_net_check "$CTID"; then
+  # Wenn schon Override gesetzt wurde, brechen wir mit klarer Diagnose ab
+  if [[ -n "${DNS_OVERRIDE:-}" ]]; then
+    ui_msg "Netzwerk/DNS Problem" "Der Container kann 'deb.debian.org' nicht auflösen.\n\nDu hast bereits einen DNS Override gesetzt (${DNS_OVERRIDE}), aber die Auflösung funktioniert trotzdem nicht.\n\nPrüfe:\n- DHCP/Gateway\n- VLAN/Firewall\n- IPv6 Router Advertisements\n- DNS im Netzwerk\n\nTipp: pct exec ${CTID} -- cat /etc/resolv.conf"
+    err "DNS/Netzwerk im LXC nicht funktional (trotz DNS Override)."
+  fi
+
+  ui_msg "Netzwerk/DNS Problem" "Der Container kann 'deb.debian.org' nicht auflösen.\n\nDas führt später zu Fehlern wie:\n\"Temporary failure resolving 'deb.debian.org'\"\n\nDu kannst jetzt einen DNS Server als Override setzen (empfohlen: 1.1.1.1)."
+  DNS_OVERRIDE="$(ui_input "DNS Override" "DNS Server setzen (z.B. 1.1.1.1)\n\nLeer lassen = Abbruch" "1.1.1.1")"
+  [[ -n "$DNS_OVERRIDE" ]] || err "Abbruch: DNS Override nicht gesetzt und DNS ist defekt."
+
+  pct set "$CTID" --nameserver "$DNS_OVERRIDE"
+  pct restart "$CTID"
+  sleep 6
+
+  if ! lxc_net_check "$CTID"; then
+    ui_msg "Netzwerk/DNS Problem" "Trotz DNS Override (${DNS_OVERRIDE}) kann der Container 'deb.debian.org' nicht auflösen.\n\nBitte manuell prüfen:\n- pct exec ${CTID} -- cat /etc/resolv.conf\n- pct exec ${CTID} -- ip r\n- Routing/Firewall/VLAN\n"
+    err "DNS/Netzwerk im LXC nicht funktional (nach DNS Override)."
+  fi
+fi
 
 ### ---------------------------
 ### Docker im LXC installieren
