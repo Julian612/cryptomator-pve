@@ -1,30 +1,26 @@
 #!/usr/bin/env bash
 # cryptomator-hub-pve.sh
 #
-# Proxmox VE helper-artiges Install-Script für Cryptomator Hub in Debian 12 LXC (Docker Compose)
+# Proxmox VE helper-artiges Install-Script fuer Cryptomator Hub in Debian 12 LXC (Docker Compose)
 #
 # Varianten:
 #  - Internal Keycloak: Postgres + Keycloak + Hub (Realm/Clients via realm.json Import)
 #  - External Keycloak: Postgres + Hub (Keycloak existiert extern; Realm/Clients/Secrets extern bereitstellen)
 #
-# UI:
-#  - Whiptail (Proxmox-Helper-Look & Feel: graues Fenster, blauer Hintergrund)
-#  - Defaults werden angezeigt und bei ENTER übernommen
+# Fixes (gegen deine beobachteten Probleme):
+#  - LXC Template wird dynamisch via `pveam available` ermittelt (kein Hardcode wie debian-12-standard_12.7-1_amd64.tar.zst)
+#  - DNS-Check im LXC + optionaler DNS-Override bei DHCP (gegen "Temporary failure resolving")
+#  - initdb.sql Permissions: 0644 + db-init dir 0755 (gegen "Permission denied" im Postgres Init)
+#  - Postgres Healthcheck + hub depends_on service_healthy (gegen Race "Connection refused")
+#  - Defaults werden bei ENTER sauber uebernommen (Image Defaults etc.)
 #
-# Robustheit:
-#  - Template wird NICHT hardcodiert, sondern automatisch via `pveam available` als neuestes Debian-12-Template ermittelt
-#  - Template-Storage (vztmpl) wird ausgewählt/validiert
-#  - URLs werden normalisiert (fehlendes https:// wird ergänzt)
-#  - Images werden validiert (image:tag)
-#  - DNS/Netzwerk wird im LXC geprüft; optionaler DNS-Override auch bei DHCP möglich
-#
-# Ausführung:
+# Ausfuehrung:
 #  - Auf dem Proxmox Host als root
-
+#
 set -euo pipefail
 
 ### ---------------------------
-### UI: Proxmox Helper Look & Feel
+### UI: Proxmox Helper Look & Feel (grau/blau)
 ### ---------------------------
 export NEWT_COLORS='
 root=white,blue
@@ -108,25 +104,18 @@ validate_image() {
   [[ "$v" == *:* ]] || err "$label muss Format image:tag haben (z.B. postgres:14-alpine). Eingabe: '$v'"
 }
 
-# Netz/DNS Checks im Container (ohne zusätzliche Tools)
 lxc_net_check() {
   local ctid="$1"
-  # IP-Connectivity (ICMP kann geblockt sein; ist aber oft ok). Wir versuchen beides.
   pct_exec "$ctid" "ip r >/dev/null 2>&1" || return 1
-
-  # DNS Check via getent (glibc) – zuverlässig ohne ping DNS
   pct_exec "$ctid" "getent ahosts deb.debian.org >/dev/null 2>&1" && return 0
-
-  # Fallback: ping auf Namen (wenn getent fehlt, sehr selten)
   pct_exec "$ctid" "ping -c 1 -W 2 deb.debian.org >/dev/null 2>&1" && return 0
-
   return 1
 }
 
 ### ---------------------------
 ### Preflight
 ### ---------------------------
-[[ "$(id -u)" -eq 0 ]] || err "Bitte als root auf dem Proxmox VE Host ausführen."
+[[ "$(id -u)" -eq 0 ]] || err "Bitte als root auf dem Proxmox VE Host ausfuehren."
 need_cmd pveversion
 need_cmd pct
 need_cmd pveam
@@ -137,14 +126,21 @@ need_cmd sed
 need_cmd grep
 ensure_whiptail
 
-ui_msg "Cryptomator Hub Installer" "Dieses Script deployt Cryptomator Hub in einem Debian 12 LXC auf Proxmox VE.\n\nVariante wählbar:\n- Internal Keycloak\n- External Keycloak\n\nAbbruch jederzeit mit ESC."
+ui_msg "Cryptomator Hub Installer" \
+"Dieses Script deployt Cryptomator Hub in einem Debian 12 LXC auf Proxmox VE.
+
+Varianten:
+- Internal Keycloak (Postgres + Keycloak + Hub)
+- External Keycloak (Postgres + Hub, externer Keycloak)
+
+Abbruch jederzeit mit ESC."
 
 ### ---------------------------
-### Variante wählen
+### Variante waehlen
 ### ---------------------------
 MODE="$(ui_menu "Variante" "Welche Variante willst du deployen?" 14 80 5 \
   "internal" "Internal Keycloak (Postgres + Keycloak + Hub)" \
-  "external" "External Keycloak (Postgres + Hub, Keycloak existiert extern)")"
+  "external" "External Keycloak (Postgres + Hub, Keycloak extern)")"
 
 USE_EXTERNAL_KC="no"
 [[ "$MODE" == "external" ]] && USE_EXTERNAL_KC="yes"
@@ -155,7 +151,7 @@ USE_EXTERNAL_KC="no"
 CTID="$(ui_input "LXC" "CTID (numerisch)\n\nHinweis: muss frei sein." "120")"
 [[ "$CTID" =~ ^[0-9]+$ ]] || err "CTID muss numerisch sein."
 if pct status "$CTID" >/dev/null 2>&1; then
-  err "CTID $CTID existiert bereits. Bitte andere CTID wählen oder Container entfernen."
+  err "CTID $CTID existiert bereits. Bitte andere CTID waehlen oder Container entfernen."
 fi
 
 HOSTNAME="$(ui_input "LXC" "Hostname des LXC" "cryptomator-hub")"
@@ -163,22 +159,22 @@ TZ="$(ui_input "LXC" "Zeitzone im LXC" "Europe/Zurich")"
 
 CORES="$(ui_input "Ressourcen" "CPU Cores" "2")"
 RAM="$(ui_input "Ressourcen" "RAM (MB)" "2048")"
-DISK_GB="$(ui_input "Ressourcen" "Disk (GB) – RootFS Grösse" "16")"
+DISK_GB="$(ui_input "Ressourcen" "Disk (GB) – RootFS Groesse" "16")"
 SWAP_MB="$(ui_input "Ressourcen" "Swap (MB)" "512")"
-[[ "$CORES" =~ ^[0-9]+$ && "$RAM" =~ ^[0-9]+$ && "$DISK_GB" =~ ^[0-9]+$ && "$SWAP_MB" =~ ^[0-9]+$ ]] || err "Ressourcenwerte müssen numerisch sein."
+[[ "$CORES" =~ ^[0-9]+$ && "$RAM" =~ ^[0-9]+$ && "$DISK_GB" =~ ^[0-9]+$ && "$SWAP_MB" =~ ^[0-9]+$ ]] || err "Ressourcenwerte muessen numerisch sein."
 
 ### ---------------------------
 ### Storage
 ### ---------------------------
-STORAGE_ROOTFS="$(ui_input "Storage" "Proxmox Storage für RootFS\n\nBeispiel: local-lvm, zfs, SSDStorage" "local-lvm")"
+STORAGE_ROOTFS="$(ui_input "Storage" "Proxmox Storage fuer RootFS\n\nBeispiel: local-lvm, zfs, SSDStorage" "local-lvm")"
 
 mapfile -t VZT_STORAGES < <(pvesm status --content vztmpl 2>/dev/null | awk 'NR>1{print $1}' | sort -u)
 if [[ "${#VZT_STORAGES[@]}" -eq 0 ]]; then
-  TEMPLATE_STORAGE="$(ui_input "Templates" "Storage für LXC Templates (Content: vztmpl)\n\nHinweis: Oft 'local'." "local")"
+  TEMPLATE_STORAGE="$(ui_input "Templates" "Storage fuer LXC Templates (Content: vztmpl)\n\nHinweis: Oft 'local'." "local")"
 else
   MENU_ITEMS=()
   for s in "${VZT_STORAGES[@]}"; do MENU_ITEMS+=("$s" "Storage mit vztmpl"); done
-  TEMPLATE_STORAGE="$(ui_menu "Templates" "Wähle Storage für LXC Templates (vztmpl)" 14 80 6 "${MENU_ITEMS[@]}")"
+  TEMPLATE_STORAGE="$(ui_menu "Templates" "Waehle Storage fuer LXC Templates (vztmpl)" 14 80 6 "${MENU_ITEMS[@]}")"
 fi
 
 ### ---------------------------
@@ -200,9 +196,8 @@ if [[ "$USE_DHCP" == "no" ]]; then
   IP_CIDR="$(ui_input "Netzwerk" "Statische IP inkl. CIDR (z.B. 192.168.1.50/24)" "")"
   GATEWAY="$(ui_input "Netzwerk" "Gateway (z.B. 192.168.1.1)" "")"
   DNS_SERVER="$(ui_input "Netzwerk" "DNS Server (z.B. 1.1.1.1)" "1.1.1.1")"
-  [[ -n "$IP_CIDR" && -n "$GATEWAY" ]] || err "Für statische IP müssen IP_CIDR und GATEWAY gesetzt sein."
+  [[ -n "$IP_CIDR" && -n "$GATEWAY" ]] || err "Fuer statische IP muessen IP_CIDR und GATEWAY gesetzt sein."
 else
-  # DHCP: optionaler Override, weil DHCP/IPv6/Resolver in LXCs manchmal nicht zuverlässig ist
   DNS_OVERRIDE="$(ui_input "Netzwerk" "DNS Override (optional)\n\nLeer lassen = DHCP/DHCPv6 verwenden.\nBei Problemen: z.B. 1.1.1.1 oder 9.9.9.9" "")"
 fi
 
@@ -220,20 +215,20 @@ if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
 fi
 HUB_BIND_PORT="$(ui_input "Ports" "Hub bind port (host-local)\n\nReverse Proxy forwarded to this port." "8082")"
 
-if ui_yesno "Ports" "Ports öffentlich binden (0.0.0.0) statt nur localhost?\n\nEmpfehlung: Nein (Reverse Proxy verwenden)."; then
+if ui_yesno "Ports" "Ports oeffentlich binden (0.0.0.0) statt nur localhost?\n\nEmpfehlung: Nein (Reverse Proxy verwenden)."; then
   BIND_IP="0.0.0.0"
 else
   BIND_IP="127.0.0.1"
 fi
 
-POSTGRES_IMAGE="$(ui_input "Images" "Postgres Image\n\nDefault wird bei ENTER übernommen." "postgres:14-alpine")"
-HUB_IMAGE="$(ui_input "Images" "Hub Image\n\nDefault wird bei ENTER übernommen." "ghcr.io/cryptomator/hub:stable")"
+POSTGRES_IMAGE="$(ui_input "Images" "Postgres Image\n\nDefault wird bei ENTER uebernommen." "postgres:14-alpine")"
+HUB_IMAGE="$(ui_input "Images" "Hub Image\n\nDefault wird bei ENTER uebernommen." "ghcr.io/cryptomator/hub:stable")"
 validate_image "$POSTGRES_IMAGE" "Postgres Image"
 validate_image "$HUB_IMAGE" "Hub Image"
 
 KEYCLOAK_IMAGE="ghcr.io/cryptomator/keycloak:26.5.3"
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
-  KEYCLOAK_IMAGE="$(ui_input "Images" "Keycloak Image\n\nDefault wird bei ENTER übernommen." "ghcr.io/cryptomator/keycloak:26.5.3")"
+  KEYCLOAK_IMAGE="$(ui_input "Images" "Keycloak Image\n\nDefault wird bei ENTER uebernommen." "ghcr.io/cryptomator/keycloak:26.5.3")"
   validate_image "$KEYCLOAK_IMAGE" "Keycloak Image"
 fi
 
@@ -242,7 +237,6 @@ fi
 ### ---------------------------
 HUB_REDIRECT_URI_DEFAULT="${HUB_PUBLIC_BASE%/}/*"
 HUB_REDIRECT_URI="$(ui_input "OIDC" "Hub Redirect URI (Keycloak client: cryptomatorhub)\n\nBeispiel: ${HUB_REDIRECT_URI_DEFAULT}" "$HUB_REDIRECT_URI_DEFAULT")"
-
 HUB_OIDC_CLIENT_ID="$(ui_input "OIDC" "OIDC Client ID (Hub)" "cryptomatorhub")"
 HUB_SYSTEM_CLIENT_ID="$(ui_input "OIDC" "System Client ID (Keycloak)" "cryptomatorhub-system")"
 
@@ -262,7 +256,7 @@ if [[ "$USE_EXTERNAL_KC" == "yes" ]]; then
   EXTERNAL_KC_REALM="$(ui_input "External Keycloak" "Realm Name im externen Keycloak" "cryptomator")"
   KC_INTERNAL_URL="$(ui_input "External Keycloak" "Keycloak interne URL (vom Hub-Container erreichbar)\n\nOft identisch zur Public URL." "${KC_PUBLIC_BASE%/}")"
   EXTERNAL_KC_ISSUER_DEFAULT="${KC_PUBLIC_BASE%/}/realms/${EXTERNAL_KC_REALM}"
-  EXTERNAL_KC_ISSUER="$(ui_input "External Keycloak" "OIDC Issuer\n\nBeispiel: ${EXTERNAL_KC_ISSUER_DEFAULT}" "$EXTERNAL_KC_ISSUER_DEFAULT")"
+  EXTERNAL_KC_ISSUER="$(ui_input "External Keycloak" "OIDC Issuer (QUARKUS_OIDC_TOKEN_ISSUER)\n\nBeispiel: ${EXTERNAL_KC_ISSUER_DEFAULT}" "$EXTERNAL_KC_ISSUER_DEFAULT")"
   EXTERNAL_KC_AUTH_SERVER_URL="$(ui_input "External Keycloak" "OIDC Auth Server URL (QUARKUS_OIDC_AUTH_SERVER_URL)\n\nOft identisch zum Issuer." "$EXTERNAL_KC_ISSUER")"
   HUB_SYSTEM_CLIENT_SECRET="$(ui_input "External Keycloak" "System Client Secret (aus externem Keycloak)\n\nWichtig: nicht leer." "")"
   [[ -n "$HUB_SYSTEM_CLIENT_SECRET" ]] || err "System Client Secret darf nicht leer sein (External Keycloak)."
@@ -277,13 +271,13 @@ else
 fi
 
 ### ---------------------------
-### Template ermitteln (nicht hardcodiert) + downloaden
+### Template ermitteln + downloaden (kein Hardcode)
 ### ---------------------------
 info "Aktualisiere Template-Katalog (pveam update)"
 pveam update >/dev/null
 
 if ! pvesm status --content vztmpl 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$TEMPLATE_STORAGE"; then
-  err "Der gewählte Template-Storage '$TEMPLATE_STORAGE' unterstützt kein 'vztmpl'. Wähle einen Storage mit Content 'vztmpl' (z.B. local)."
+  err "Der gewaehlte Template-Storage '$TEMPLATE_STORAGE' unterstuetzt kein 'vztmpl'. Bitte einen Storage mit Content 'vztmpl' waehlen (z.B. local)."
 fi
 
 TEMPLATE="$(pveam available --section system 2>/dev/null \
@@ -292,9 +286,7 @@ TEMPLATE="$(pveam available --section system 2>/dev/null \
   | sort -V \
   | tail -n 1)"
 
-if [[ -z "${TEMPLATE:-}" ]]; then
-  err "Konnte kein Debian-12-Template via 'pveam available' finden. Prüfe Internet/DNS oder Proxmox Repo-Konfiguration."
-fi
+[[ -n "${TEMPLATE:-}" ]] || err "Konnte kein Debian-12-Template via 'pveam available' finden. Pruefe Internet/DNS/Repos."
 
 info "Verwende LXC Template: $TEMPLATE (Storage: $TEMPLATE_STORAGE)"
 
@@ -327,9 +319,6 @@ pct create "$CTID" "${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}" \
   --ostype debian \
   --timezone "$TZ"
 
-# DNS setzen:
-# - statisch: DNS_SERVER wird gesetzt
-# - DHCP: falls DNS_OVERRIDE angegeben, wird der Container-Resolver explizit gesetzt (um "Temporary failure resolving" zu vermeiden)
 if [[ "$USE_DHCP" == "no" ]]; then
   pct set "$CTID" --nameserver "$DNS_SERVER"
 else
@@ -342,15 +331,28 @@ info "Starte LXC CT $CTID"
 pct start "$CTID"
 sleep 6
 
-# DNS/Netzwerk check: Wenn DNS kaputt ist, bieten wir eine automatische Korrektur (DNS setzen) an.
 if ! lxc_net_check "$CTID"; then
-  # Wenn schon Override gesetzt wurde, brechen wir mit klarer Diagnose ab
   if [[ -n "${DNS_OVERRIDE:-}" ]]; then
-    ui_msg "Netzwerk/DNS Problem" "Der Container kann 'deb.debian.org' nicht auflösen.\n\nDu hast bereits einen DNS Override gesetzt (${DNS_OVERRIDE}), aber die Auflösung funktioniert trotzdem nicht.\n\nPrüfe:\n- DHCP/Gateway\n- VLAN/Firewall\n- IPv6 Router Advertisements\n- DNS im Netzwerk\n\nTipp: pct exec ${CTID} -- cat /etc/resolv.conf"
+    ui_msg "Netzwerk/DNS Problem" \
+"Der Container kann 'deb.debian.org' nicht aufloesen (trotz DNS Override: ${DNS_OVERRIDE}).
+
+Pruefe:
+- DHCP/Gateway
+- VLAN/Firewall
+- DNS im Netzwerk
+
+Tipp:
+pct exec ${CTID} -- cat /etc/resolv.conf"
     err "DNS/Netzwerk im LXC nicht funktional (trotz DNS Override)."
   fi
 
-  ui_msg "Netzwerk/DNS Problem" "Der Container kann 'deb.debian.org' nicht auflösen.\n\nDas führt später zu Fehlern wie:\n\"Temporary failure resolving 'deb.debian.org'\"\n\nDu kannst jetzt einen DNS Server als Override setzen (empfohlen: 1.1.1.1)."
+  ui_msg "Netzwerk/DNS Problem" \
+"Der Container kann 'deb.debian.org' nicht aufloesen.
+Das fuehrt spaeter zu Fehlern wie:
+\"Temporary failure resolving 'deb.debian.org'\"
+
+Setze jetzt einen DNS Override (empfohlen: 1.1.1.1)."
+
   DNS_OVERRIDE="$(ui_input "DNS Override" "DNS Server setzen (z.B. 1.1.1.1)\n\nLeer lassen = Abbruch" "1.1.1.1")"
   [[ -n "$DNS_OVERRIDE" ]] || err "Abbruch: DNS Override nicht gesetzt und DNS ist defekt."
 
@@ -359,7 +361,13 @@ if ! lxc_net_check "$CTID"; then
   sleep 6
 
   if ! lxc_net_check "$CTID"; then
-    ui_msg "Netzwerk/DNS Problem" "Trotz DNS Override (${DNS_OVERRIDE}) kann der Container 'deb.debian.org' nicht auflösen.\n\nBitte manuell prüfen:\n- pct exec ${CTID} -- cat /etc/resolv.conf\n- pct exec ${CTID} -- ip r\n- Routing/Firewall/VLAN\n"
+    ui_msg "Netzwerk/DNS Problem" \
+"Trotz DNS Override (${DNS_OVERRIDE}) kann der Container 'deb.debian.org' nicht aufloesen.
+
+Bitte manuell pruefen:
+- pct exec ${CTID} -- cat /etc/resolv.conf
+- pct exec ${CTID} -- ip r
+- Routing/Firewall/VLAN"
     err "DNS/Netzwerk im LXC nicht funktional (nach DNS Override)."
   fi
 fi
@@ -391,7 +399,7 @@ DB_INIT_DIR="${DATA_DIR}/db-init"
 KC_IMPORT_DIR="${DATA_DIR}/kc-import"
 
 pct_exec "$CTID" "mkdir -p '${APP_DIR}' '${DB_DATA_DIR}' '${DB_INIT_DIR}'"
-pct_exec "$CTID" "chmod 755 '${APP_DIR}'"
+pct_exec "$CTID" "chmod 755 '${APP_DIR}' '${DB_INIT_DIR}'"
 pct_exec "$CTID" "chmod 700 '${DATA_DIR}' || true"
 
 POSTGRES_PASSWORD="$(rand_hex 24)"
@@ -407,7 +415,7 @@ if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
   REALM_ADMIN_PASSWORD="$(rand_b64 18)"
 fi
 
-# initdb.sql
+### initdb.sql (WICHTIG: Permissions 0644, sonst Postgres "Permission denied")
 if [[ "$USE_EXTERNAL_KC" == "yes" ]]; then
   INITDB_SQL=$(cat <<EOF
 CREATE USER hub WITH ENCRYPTED PASSWORD '${HUB_DB_PASSWORD}';
@@ -428,7 +436,7 @@ EOF
 )
 fi
 
-# realm.json (nur internal)
+### realm.json (nur internal)
 REALM_JSON=""
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
   REALM_ID="$(uuid_any)"
@@ -535,10 +543,10 @@ EOF
 )
 fi
 
-# .env
+### .env
 ENV_CONTENT=$(cat <<EOF
 # Cryptomator Hub deployment (.env)
-# WICHTIG: Diese Datei enthält Secrets. Nicht in Git einchecken.
+# WICHTIG: Diese Datei enthaelt Secrets. Nicht in Git einchecken.
 
 USE_EXTERNAL_KC=${USE_EXTERNAL_KC}
 
@@ -578,108 +586,127 @@ REALM_ADMIN_TEMPORARY=${REALM_ADMIN_TEMP}
 EOF
 )
 
-# compose.yml
+### compose.yml mit Healthchecks (Postgres ready) + depends_on condition
 if [[ "$USE_EXTERNAL_KC" == "yes" ]]; then
-  COMPOSE_CONTENT=$(cat <<EOF
+  COMPOSE_CONTENT=$(cat <<'EOF'
 services:
   postgres:
-    image: \${POSTGRES_IMAGE}
+    image: ${POSTGRES_IMAGE}
     volumes:
-      - ${DB_INIT_DIR}:/docker-entrypoint-initdb.d
-      - ${DB_DATA_DIR}:/var/lib/postgresql/data
+      - /opt/cryptomator-hub/data/db-init:/docker-entrypoint-initdb.d
+      - /opt/cryptomator-hub/data/db-data:/var/lib/postgresql/data
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_INITDB_ARGS: --encoding=UTF8
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
   hub:
-    image: \${HUB_IMAGE}
+    image: ${HUB_IMAGE}
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     ports:
-      - "\${BIND_IP}:\${HUB_BIND_PORT}:8080"
+      - "${BIND_IP}:${HUB_BIND_PORT}:8080"
     restart: unless-stopped
     environment:
       HUB_PUBLIC_ROOT_PATH: /
-      HUB_KEYCLOAK_PUBLIC_URL: \${KC_PUBLIC_BASE}
-      HUB_KEYCLOAK_LOCAL_URL: \${KC_INTERNAL_URL}
-      HUB_KEYCLOAK_REALM: \${EXTERNAL_KC_REALM}
-      HUB_KEYCLOAK_SYSTEM_CLIENT_ID: \${HUB_SYSTEM_CLIENT_ID}
-      HUB_KEYCLOAK_SYSTEM_CLIENT_SECRET: \${HUB_SYSTEM_CLIENT_SECRET}
+      HUB_KEYCLOAK_PUBLIC_URL: ${KC_PUBLIC_BASE}
+      HUB_KEYCLOAK_LOCAL_URL: ${KC_INTERNAL_URL}
+      HUB_KEYCLOAK_REALM: ${EXTERNAL_KC_REALM}
+      HUB_KEYCLOAK_SYSTEM_CLIENT_ID: ${HUB_SYSTEM_CLIENT_ID}
+      HUB_KEYCLOAK_SYSTEM_CLIENT_SECRET: ${HUB_SYSTEM_CLIENT_SECRET}
       HUB_KEYCLOAK_SYNCER_PERIOD: 5m
       HUB_KEYCLOAK_OIDC_CRYPTOMATOR_CLIENT_ID: cryptomator
 
-      QUARKUS_OIDC_AUTH_SERVER_URL: \${EXTERNAL_KC_AUTH_SERVER_URL}
-      QUARKUS_OIDC_TOKEN_ISSUER: \${EXTERNAL_KC_ISSUER}
-      QUARKUS_OIDC_CLIENT_ID: \${HUB_OIDC_CLIENT_ID}
+      QUARKUS_OIDC_AUTH_SERVER_URL: ${EXTERNAL_KC_AUTH_SERVER_URL}
+      QUARKUS_OIDC_TOKEN_ISSUER: ${EXTERNAL_KC_ISSUER}
+      QUARKUS_OIDC_CLIENT_ID: ${HUB_OIDC_CLIENT_ID}
 
       QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/hub
       QUARKUS_DATASOURCE_USERNAME: hub
-      QUARKUS_DATASOURCE_PASSWORD: \${HUB_DB_PASSWORD}
+      QUARKUS_DATASOURCE_PASSWORD: ${HUB_DB_PASSWORD}
       QUARKUS_HTTP_PROXY_PROXY_ADDRESS_FORWARDING: "true"
 EOF
 )
 else
-  COMPOSE_CONTENT=$(cat <<EOF
+  COMPOSE_CONTENT=$(cat <<'EOF'
 services:
   postgres:
-    image: \${POSTGRES_IMAGE}
+    image: ${POSTGRES_IMAGE}
     volumes:
-      - ${DB_INIT_DIR}:/docker-entrypoint-initdb.d
-      - ${DB_DATA_DIR}:/var/lib/postgresql/data
+      - /opt/cryptomator-hub/data/db-init:/docker-entrypoint-initdb.d
+      - /opt/cryptomator-hub/data/db-data:/var/lib/postgresql/data
     restart: unless-stopped
     environment:
-      POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_INITDB_ARGS: --encoding=UTF8
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
 
   keycloak:
-    image: \${KEYCLOAK_IMAGE}
+    image: ${KEYCLOAK_IMAGE}
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
     command: start --optimized --import-realm
     volumes:
-      - ${KC_IMPORT_DIR}:/opt/keycloak/data/import
+      - /opt/cryptomator-hub/data/kc-import:/opt/keycloak/data/import
     ports:
-      - "\${BIND_IP}:\${KC_BIND_PORT}:8080"
+      - "${BIND_IP}:${KC_BIND_PORT}:8080"
     restart: unless-stopped
     environment:
-      KEYCLOAK_ADMIN: \${KEYCLOAK_ADMIN_USER}
-      KEYCLOAK_ADMIN_PASSWORD: \${KEYCLOAK_ADMIN_PASSWORD}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN_USER}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
       KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: \${KC_DB_PASSWORD}
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
       KC_HEALTH_ENABLED: "true"
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded
-      KC_HTTP_RELATIVE_PATH: \${KC_RELATIVE_PATH}
-      KC_HOSTNAME: \${KC_PUBLIC_BASE}
+      KC_HTTP_RELATIVE_PATH: ${KC_RELATIVE_PATH}
+      KC_HOSTNAME: ${KC_PUBLIC_BASE}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9000${KC_RELATIVE_PATH}/health/live >/dev/null 2>&1 || curl -fsS http://localhost:9000/kc/health/live >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 60
 
   hub:
-    image: \${HUB_IMAGE}
+    image: ${HUB_IMAGE}
     depends_on:
-      - postgres
-      - keycloak
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
     ports:
-      - "\${BIND_IP}:\${HUB_BIND_PORT}:8080"
+      - "${BIND_IP}:${HUB_BIND_PORT}:8080"
     restart: unless-stopped
     environment:
       HUB_PUBLIC_ROOT_PATH: /
-      HUB_KEYCLOAK_PUBLIC_URL: \${KC_PUBLIC_BASE}
-      HUB_KEYCLOAK_LOCAL_URL: http://keycloak:8080\${KC_RELATIVE_PATH}
+      HUB_KEYCLOAK_PUBLIC_URL: ${KC_PUBLIC_BASE}
+      HUB_KEYCLOAK_LOCAL_URL: http://keycloak:8080${KC_RELATIVE_PATH}
       HUB_KEYCLOAK_REALM: cryptomator
-      HUB_KEYCLOAK_SYSTEM_CLIENT_ID: \${HUB_SYSTEM_CLIENT_ID}
-      HUB_KEYCLOAK_SYSTEM_CLIENT_SECRET: \${HUB_SYSTEM_CLIENT_SECRET}
+      HUB_KEYCLOAK_SYSTEM_CLIENT_ID: ${HUB_SYSTEM_CLIENT_ID}
+      HUB_KEYCLOAK_SYSTEM_CLIENT_SECRET: ${HUB_SYSTEM_CLIENT_SECRET}
       HUB_KEYCLOAK_SYNCER_PERIOD: 5m
       HUB_KEYCLOAK_OIDC_CRYPTOMATOR_CLIENT_ID: cryptomator
 
-      QUARKUS_OIDC_AUTH_SERVER_URL: http://keycloak:8080\${KC_RELATIVE_PATH}/realms/cryptomator
-      QUARKUS_OIDC_TOKEN_ISSUER: \${KC_PUBLIC_BASE}/realms/cryptomator
-      QUARKUS_OIDC_CLIENT_ID: \${HUB_OIDC_CLIENT_ID}
+      QUARKUS_OIDC_AUTH_SERVER_URL: http://keycloak:8080${KC_RELATIVE_PATH}/realms/cryptomator
+      QUARKUS_OIDC_TOKEN_ISSUER: ${KC_PUBLIC_BASE}/realms/cryptomator
+      QUARKUS_OIDC_CLIENT_ID: ${HUB_OIDC_CLIENT_ID}
 
       QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/hub
       QUARKUS_DATASOURCE_USERNAME: hub
-      QUARKUS_DATASOURCE_PASSWORD: \${HUB_DB_PASSWORD}
+      QUARKUS_DATASOURCE_PASSWORD: ${HUB_DB_PASSWORD}
       QUARKUS_HTTP_PROXY_PROXY_ADDRESS_FORWARDING: "true"
 EOF
 )
@@ -689,12 +716,17 @@ fi
 ### Dateien ins LXC schreiben
 ### ---------------------------
 info "Schreibe Dateien in den LXC"
-pct_exec "$CTID" "mkdir -p '${APP_DIR}' '${DB_INIT_DIR}'"
-pct_push_str "$CTID" "${DB_INIT_DIR}/initdb.sql" "$INITDB_SQL" 0600
+
+pct_exec "$CTID" "mkdir -p '${APP_DIR}' '${DB_INIT_DIR}' '${DB_DATA_DIR}'"
+pct_exec "$CTID" "chmod 755 '${DB_INIT_DIR}'"
+
+# initdb.sql muss fuer Postgres-Container lesbar sein (0644)
+pct_push_str "$CTID" "${DB_INIT_DIR}/initdb.sql" "$INITDB_SQL" 0644
 
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
   pct_exec "$CTID" "mkdir -p '${KC_IMPORT_DIR}'"
-  pct_push_str "$CTID" "${KC_IMPORT_DIR}/realm.json" "$REALM_JSON" 0600
+  # 0644 ist hier ebenfalls robust (Keycloak-Container kann sicher lesen)
+  pct_push_str "$CTID" "${KC_IMPORT_DIR}/realm.json" "$REALM_JSON" 0644
 fi
 
 pct_push_str "$CTID" "${APP_DIR}/compose.yml" "$COMPOSE_CONTENT" 0644
@@ -715,15 +747,24 @@ CTID:            ${CTID}
 Hostname:        ${HOSTNAME}
 Variante:        $( [[ "$USE_EXTERNAL_KC" == "yes" ]] && echo "External Keycloak" || echo "Internal Keycloak" )
 
-Hub lokal:       http://${BIND_IP}:${HUB_BIND_PORT}/
+Hub bind:        ${BIND_IP}:${HUB_BIND_PORT} -> 8080
 Hub Public:      ${HUB_PUBLIC_BASE%/}
 
 Keycloak Public: ${KC_PUBLIC_BASE%/}
 "
 
+if [[ "$BIND_IP" == "127.0.0.1" ]]; then
+  SUMMARY+="
+Hinweis:
+- Ports sind nur lokal (127.0.0.1) gebunden.
+- Externer Zugriff typischerweise via Reverse Proxy (443) auf ${BIND_IP}:${HUB_BIND_PORT}.
+"
+fi
+
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
   SUMMARY+="
-Keycloak lokal:  http://${BIND_IP}:${KC_BIND_PORT}${KC_RELATIVE_PATH}
+Keycloak bind:   ${BIND_IP}:${KC_BIND_PORT} -> 8080
+Keycloak Path:   ${KC_RELATIVE_PATH}
 
 Keycloak Admin (container env):
   user: admin
@@ -735,7 +776,7 @@ Realm Admin (cryptomator):
   temporary: ${REALM_ADMIN_TEMP}
 
 Hinweis:
-- Wenn du KC_PUBLIC_BASE oder KC_RELATIVE_PATH später änderst, entferne '--optimized' im Keycloak command.
+- Wenn du KC_PUBLIC_BASE oder KC_RELATIVE_PATH spaeter aenderst, entferne '--optimized' im Keycloak command.
 "
 else
   SUMMARY+="
@@ -744,11 +785,13 @@ External Keycloak:
   issuer: ${EXTERNAL_KC_ISSUER}
 
 Hinweis:
-- Realm/Clients im externen Keycloak müssen korrekt existieren (cryptomatorhub, cryptomatorhub-system, cryptomator).
+- Realm/Clients/Secrets muessen im externen Keycloak korrekt existieren (cryptomatorhub, cryptomatorhub-system, cryptomator).
 "
 fi
 
 ui_msg "Fertig" "$SUMMARY"
 echo "$SUMMARY"
-echo "Logs im LXC:"
-echo "  pct exec ${CTID} -- bash -lc 'cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml logs -f'"
+echo
+echo "Troubleshooting (Logs):"
+echo "  pct exec ${CTID} -- bash -lc 'cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml ps'"
+echo "  pct exec ${CTID} -- bash -lc 'cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml logs -f --no-color'"
