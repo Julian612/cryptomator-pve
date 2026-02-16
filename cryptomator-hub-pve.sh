@@ -2,21 +2,26 @@
 # cryptomator-hub-pve.sh
 #
 # Proxmox VE helper-artiges Install-Script für Cryptomator Hub in Debian 12 LXC (Docker Compose)
-# Unterstützt:
-#  - Internal Keycloak: Postgres + Keycloak + Hub (Realm/Clients via realm.json Import)
-#  - External Keycloak: Postgres + Hub (Keycloak existiert extern, Objekte manuell erstellen)
 #
-# Designziele:
-#  - Whiptail UI (Proxmox-Helper-Stil)
-#  - Defaults werden angezeigt und bei leerer Eingabe übernommen
-#  - Robustere Validierung (URLs, Images)
-#  - Template-Storage (vztmpl) wird abgefragt/ausgewählt (nicht hardcodiert "local")
+# Varianten:
+#  - Internal Keycloak: Postgres + Keycloak + Hub (Realm/Clients via realm.json Import)
+#  - External Keycloak: Postgres + Hub (Keycloak existiert extern; Realm/Clients/Secrets extern bereitstellen)
+#
+# UI:
+#  - Whiptail (Proxmox-Helper-Look & Feel: graues Fenster, blauer Hintergrund)
+#  - Defaults werden angezeigt und bei ENTER übernommen
+#
+# Robustheit:
+#  - Template wird NICHT hardcodiert, sondern automatisch via `pveam available` als neuestes Debian-12-Template ermittelt
+#  - Template-Storage (vztmpl) wird ausgewählt/validiert
+#  - URLs werden normalisiert (fehlendes https:// wird ergänzt)
+#  - Images werden validiert (image:tag)
 #
 # Ausführung:
 #  - Auf dem Proxmox Host als root
 #
 # Sicherheit:
-#  - Secrets landen im LXC unter /opt/cryptomator-hub/.env (chmod 600). Nicht ins Git einchecken.
+#  - Secrets werden im LXC unter /opt/cryptomator-hub/.env gespeichert (chmod 600). Nicht ins Git einchecken.
 
 set -euo pipefail
 
@@ -39,7 +44,7 @@ sellistbox=black,lightgray
 '
 
 ### ---------------------------
-### Helper
+### Helpers
 ### ---------------------------
 err() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -53,23 +58,21 @@ ensure_whiptail() {
   apt-get install -y whiptail >/dev/null
 }
 
-# whiptail wrappers (cancel => exit)
 ui_msg() { whiptail --title "${1:-Info}" --msgbox "${2:-}" 12 80; }
-ui_yesno() { # returns 0=yes 1=no
-  whiptail --title "${1:-Frage}" --yesno "${2:-}" 12 80
-}
-ui_input() { # ui_input "title" "text" "default" -> stdout
+ui_yesno() { whiptail --title "${1:-Frage}" --yesno "${2:-}" 12 80; } # 0=yes 1=no
+
+ui_input() { # ui_input "title" "text" "default" -> stdout ; ENTER => default
   local title="$1" text="$2" def="${3:-}"
   local out
   out="$(whiptail --title "$title" --inputbox "$text" 12 80 "$def" 3>&1 1>&2 2>&3)" || exit 1
-  # whiptail liefert "" wenn ENTER ohne Eingabe -> Default übernehmen
   if [[ -z "$out" ]]; then
     echo "$def"
   else
     echo "$out"
   fi
 }
-ui_menu() { # ui_menu "title" "text" height width listheight items... -> stdout (tag)
+
+ui_menu() { # ui_menu "title" "text" h w lh items... -> stdout
   local title="$1" text="$2" h="${3:-16}" w="${4:-80}" lh="${5:-8}"
   shift 5
   local out
@@ -82,7 +85,7 @@ rand_b64() { local n="${1:-24}"; openssl rand -base64 "$n" | tr -d '\n'; }
 
 pct_exec() { local ctid="$1"; shift; pct exec "$ctid" -- bash -lc "$*"; }
 
-pct_push_str() {
+pct_push_str() { # pct_push_str CTID /path "content" perms
   local ctid="$1" path="$2" content="$3" perms="${4:-0644}"
   local tmp
   tmp="$(mktemp)"
@@ -91,9 +94,7 @@ pct_push_str() {
   rm -f "$tmp"
 }
 
-uuid_any() {
-  if command -v uuidgen >/dev/null 2>&1; then uuidgen; else cat /proc/sys/kernel/random/uuid; fi
-}
+uuid_any() { if command -v uuidgen >/dev/null 2>&1; then uuidgen; else cat /proc/sys/kernel/random/uuid; fi; }
 
 normalise_url() {
   local u="$1"
@@ -123,7 +124,7 @@ need_cmd sed
 need_cmd grep
 ensure_whiptail
 
-ui_msg "Cryptomator Hub Installer" "Dieses Script deployt Cryptomator Hub in einem Debian 12 LXC auf Proxmox VE.\n\nDu kannst Internal Keycloak oder External Keycloak wählen.\n\nAbbruch jederzeit mit ESC."
+ui_msg "Cryptomator Hub Installer" "Dieses Script deployt Cryptomator Hub in einem Debian 12 LXC auf Proxmox VE.\n\nVariante wählbar:\n- Internal Keycloak\n- External Keycloak\n\nAbbruch jederzeit mit ESC."
 
 ### ---------------------------
 ### Variante wählen
@@ -136,7 +137,7 @@ USE_EXTERNAL_KC="no"
 [[ "$MODE" == "external" ]] && USE_EXTERNAL_KC="yes"
 
 ### ---------------------------
-### Basis-Parameter (LXC)
+### LXC Basis
 ### ---------------------------
 CTID="$(ui_input "LXC" "CTID (numerisch)\n\nHinweis: muss frei sein." "120")"
 [[ "$CTID" =~ ^[0-9]+$ ]] || err "CTID muss numerisch sein."
@@ -154,20 +155,14 @@ SWAP_MB="$(ui_input "Ressourcen" "Swap (MB)" "512")"
 [[ "$CORES" =~ ^[0-9]+$ && "$RAM" =~ ^[0-9]+$ && "$DISK_GB" =~ ^[0-9]+$ && "$SWAP_MB" =~ ^[0-9]+$ ]] || err "Ressourcenwerte müssen numerisch sein."
 
 ### ---------------------------
-### Storage Auswahl
+### Storage
 ### ---------------------------
+STORAGE_ROOTFS="$(ui_input "Storage" "Proxmox Storage für RootFS\n\nBeispiel: local-lvm, zfs, SSDStorage" "local-lvm")"
 
-# RootFS Storage (wo der Container liegt)
-# -> wir bieten alle storages an (user weiss was er will), Default local-lvm
-STORAGE_ROOTFS="$(ui_input "Storage" "Proxmox Storage für RootFS (z.B. local-lvm, zfs, SSDStorage)" "local-lvm")"
-
-# Template Storage (vztmpl) – wir versuchen automatisch passende Storages zu finden und als Menu anzubieten
 mapfile -t VZT_STORAGES < <(pvesm status --content vztmpl 2>/dev/null | awk 'NR>1{print $1}' | sort -u)
 if [[ "${#VZT_STORAGES[@]}" -eq 0 ]]; then
-  # Fallback: user input
   TEMPLATE_STORAGE="$(ui_input "Templates" "Storage für LXC Templates (Content: vztmpl)\n\nHinweis: Oft 'local'." "local")"
 else
-  # build whiptail menu items
   MENU_ITEMS=()
   for s in "${VZT_STORAGES[@]}"; do MENU_ITEMS+=("$s" "Storage mit vztmpl"); done
   TEMPLATE_STORAGE="$(ui_menu "Templates" "Wähle Storage für LXC Templates (vztmpl)" 14 80 6 "${MENU_ITEMS[@]}")"
@@ -194,7 +189,7 @@ if [[ "$USE_DHCP" == "no" ]]; then
 fi
 
 ### ---------------------------
-### Public URLs / Ports / Images
+### URLs / Ports / Images
 ### ---------------------------
 HUB_PUBLIC_BASE="$(ui_input "URLs" "Hub Public Base URL\n\nBeispiel: https://cryptomator.example.tld" "https://cryptomator.example.tld")"
 KC_PUBLIC_BASE="$(ui_input "URLs" "Keycloak Public Base URL\n\nBeispiel: https://auth.example.tld oder https://example.tld/kc" "https://auth.example.tld")"
@@ -203,9 +198,9 @@ KC_PUBLIC_BASE="$(normalise_url "$KC_PUBLIC_BASE")"
 
 KC_BIND_PORT="8081"
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
-  KC_BIND_PORT="$(ui_input "Ports" "Keycloak bind port (host-local)\n\nReverse Proxy: forwarded to this port." "8081")"
+  KC_BIND_PORT="$(ui_input "Ports" "Keycloak bind port (host-local)\n\nReverse Proxy forwarded to this port." "8081")"
 fi
-HUB_BIND_PORT="$(ui_input "Ports" "Hub bind port (host-local)\n\nReverse Proxy: forwarded to this port." "8082")"
+HUB_BIND_PORT="$(ui_input "Ports" "Hub bind port (host-local)\n\nReverse Proxy forwarded to this port." "8082")"
 
 if ui_yesno "Ports" "Ports öffentlich binden (0.0.0.0) statt nur localhost?\n\nEmpfehlung: Nein (Reverse Proxy verwenden)."; then
   BIND_IP="0.0.0.0"
@@ -213,21 +208,20 @@ else
   BIND_IP="127.0.0.1"
 fi
 
-POSTGRES_IMAGE="$(ui_input "Images" "Postgres Image" "postgres:14-alpine")"
-HUB_IMAGE="$(ui_input "Images" "Hub Image" "ghcr.io/cryptomator/hub:stable")"
+POSTGRES_IMAGE="$(ui_input "Images" "Postgres Image\n\nDefault wird bei ENTER übernommen." "postgres:14-alpine")"
+HUB_IMAGE="$(ui_input "Images" "Hub Image\n\nDefault wird bei ENTER übernommen." "ghcr.io/cryptomator/hub:stable")"
 validate_image "$POSTGRES_IMAGE" "Postgres Image"
 validate_image "$HUB_IMAGE" "Hub Image"
 
 KEYCLOAK_IMAGE="ghcr.io/cryptomator/keycloak:26.5.3"
 if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
-  KEYCLOAK_IMAGE="$(ui_input "Images" "Keycloak Image" "ghcr.io/cryptomator/keycloak:26.5.3")"
+  KEYCLOAK_IMAGE="$(ui_input "Images" "Keycloak Image\n\nDefault wird bei ENTER übernommen." "ghcr.io/cryptomator/keycloak:26.5.3")"
   validate_image "$KEYCLOAK_IMAGE" "Keycloak Image"
 fi
 
 ### ---------------------------
-### OIDC / Clients / Redirects
+### OIDC / Clients
 ### ---------------------------
-# Hub redirect URI default
 HUB_REDIRECT_URI_DEFAULT="${HUB_PUBLIC_BASE%/}/*"
 HUB_REDIRECT_URI="$(ui_input "OIDC" "Hub Redirect URI (Keycloak client: cryptomatorhub)\n\nBeispiel: ${HUB_REDIRECT_URI_DEFAULT}" "$HUB_REDIRECT_URI_DEFAULT")"
 
@@ -251,12 +245,11 @@ if [[ "$USE_EXTERNAL_KC" == "yes" ]]; then
   KC_INTERNAL_URL="$(ui_input "External Keycloak" "Keycloak interne URL (vom Hub-Container erreichbar)\n\nOft identisch zur Public URL." "${KC_PUBLIC_BASE%/}")"
   EXTERNAL_KC_ISSUER_DEFAULT="${KC_PUBLIC_BASE%/}/realms/${EXTERNAL_KC_REALM}"
   EXTERNAL_KC_ISSUER="$(ui_input "External Keycloak" "OIDC Issuer\n\nBeispiel: ${EXTERNAL_KC_ISSUER_DEFAULT}" "$EXTERNAL_KC_ISSUER_DEFAULT")"
-  EXTERNAL_KC_AUTH_SERVER_URL="$(ui_input "External Keycloak" "OIDC Auth Server URL (Hub QUARKUS_OIDC_AUTH_SERVER_URL)\n\nOft identisch zum Issuer." "$EXTERNAL_KC_ISSUER")"
+  EXTERNAL_KC_AUTH_SERVER_URL="$(ui_input "External Keycloak" "OIDC Auth Server URL (QUARKUS_OIDC_AUTH_SERVER_URL)\n\nOft identisch zum Issuer." "$EXTERNAL_KC_ISSUER")"
   HUB_SYSTEM_CLIENT_SECRET="$(ui_input "External Keycloak" "System Client Secret (aus externem Keycloak)\n\nWichtig: nicht leer." "")"
   [[ -n "$HUB_SYSTEM_CLIENT_SECRET" ]] || err "System Client Secret darf nicht leer sein (External Keycloak)."
 else
   KC_RELATIVE_PATH="$(ui_input "Keycloak" "Keycloak Relative Path" "/kc")"
-
   REALM_ADMIN_USER="$(ui_input "Keycloak" "Initialer Realm-Admin Username (cryptomator realm)" "admin")"
   if ui_yesno "Keycloak" "Realm-Admin Passwort bei erstem Login erzwingen (temporary)?"; then
     REALM_ADMIN_TEMP="true"
@@ -266,14 +259,29 @@ else
 fi
 
 ### ---------------------------
-### Template prüfen/downloaden
+### Template ermitteln (nicht hardcodiert) + downloaden
 ### ---------------------------
-TEMPLATE="debian-12-standard_12.7-1_amd64.tar.zst"
+info "Aktualisiere Template-Katalog (pveam update)"
+pveam update >/dev/null
 
-info "Prüfe LXC Template: $TEMPLATE auf Storage: $TEMPLATE_STORAGE"
-if ! pveam list "$TEMPLATE_STORAGE" | awk '{print $1}' | grep -qx "$TEMPLATE"; then
+if ! pvesm status --content vztmpl 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$TEMPLATE_STORAGE"; then
+  err "Der gewählte Template-Storage '$TEMPLATE_STORAGE' unterstützt kein 'vztmpl'. Wähle einen Storage mit Content 'vztmpl' (z.B. local)."
+fi
+
+TEMPLATE="$(pveam available --section system 2>/dev/null \
+  | awk '{print $2}' \
+  | grep -E '^debian-12-standard_.*_amd64\.tar\.zst$' \
+  | sort -V \
+  | tail -n 1)"
+
+if [[ -z "${TEMPLATE:-}" ]]; then
+  err "Konnte kein Debian-12-Template via 'pveam available' finden. Prüfe Internet/DNS oder Proxmox Repo-Konfiguration."
+fi
+
+info "Verwende LXC Template: $TEMPLATE (Storage: $TEMPLATE_STORAGE)"
+
+if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | awk '{print $1}' | grep -qx "$TEMPLATE"; then
   info "Template nicht vorhanden. Lade herunter..."
-  pveam update >/dev/null
   pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
 fi
 
@@ -348,7 +356,6 @@ if [[ "$USE_EXTERNAL_KC" == "no" ]]; then
   pct_exec "$CTID" "mkdir -p '${KC_IMPORT_DIR}'"
   KC_DB_PASSWORD="$(rand_hex 24)"
   KEYCLOAK_ADMIN_PASSWORD="$(rand_b64 24)"
-  # System client secret wird in internal erzeugt
   HUB_SYSTEM_CLIENT_SECRET="$(rand_hex 24)"
   REALM_ADMIN_PASSWORD="$(rand_b64 18)"
 fi
@@ -524,7 +531,7 @@ REALM_ADMIN_TEMPORARY=${REALM_ADMIN_TEMP}
 EOF
 )
 
-# compose.yml (2 Varianten)
+# compose.yml
 if [[ "$USE_EXTERNAL_KC" == "yes" ]]; then
   COMPOSE_CONTENT=$(cat <<EOF
 services:
@@ -599,7 +606,6 @@ services:
       KC_HTTP_ENABLED: "true"
       KC_PROXY_HEADERS: xforwarded
       KC_HTTP_RELATIVE_PATH: \${KC_RELATIVE_PATH}
-      # Hinweis: Cryptomator nutzt häufig URL inkl. /kc. Wenn du das änderst, entferne --optimized.
       KC_HOSTNAME: \${KC_PUBLIC_BASE}
 
   hub:
@@ -636,7 +642,6 @@ fi
 ### Dateien ins LXC schreiben
 ### ---------------------------
 info "Schreibe Dateien in den LXC"
-
 pct_exec "$CTID" "mkdir -p '${APP_DIR}' '${DB_INIT_DIR}'"
 pct_push_str "$CTID" "${DB_INIT_DIR}/initdb.sql" "$INITDB_SQL" 0600
 
@@ -655,7 +660,7 @@ info "Starte Stack (docker compose up -d)"
 pct_exec "$CTID" "cd '${APP_DIR}' && docker compose --env-file .env -f compose.yml up -d"
 
 ### ---------------------------
-### Summary (UI + stdout)
+### Summary
 ### ---------------------------
 SUMMARY="Installation abgeschlossen.
 
