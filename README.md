@@ -62,5 +62,6 @@ Separater Keycloak (bestehend)
 Auf dem Proxmox Host ausführen:
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/Julian612/cryptomator-pve/main/cryptomator-hub-pve.sh -o cryptomator-hub-pve.sh
 chmod +x cryptomator-hub-pve.sh
 ./cryptomator-hub-pve.sh
