@@ -502,6 +502,18 @@ exec_ct() {
   pct exec "$CTID" -- bash -lc "$1"
 }
 
+# write_ct_file – schreibt Datei via base64 in den Container.
+# Vermeidet stdin-Piping durch pct exec (haengt bei manchen PVE-Versionen).
+# Usage: write_ct_file /ziel/pfad [mode] <<'MARKER'
+#        Inhalt
+#        MARKER
+write_ct_file() {
+  local dest="$1" mode="${2:-0644}"
+  local b64
+  b64="$(base64 -w0)"
+  exec_ct "printf '%s' '${b64}' | base64 -d > '${dest}' && chmod ${mode} '${dest}'"
+}
+
 ############################################
 # Bootstrap im Container                    #
 ############################################
@@ -572,7 +584,8 @@ else
   USE_EXTERNAL_VALUE="yes"
 fi
 
-pct exec "$CTID" -- tee /opt/cryptomator-hub/.env > /dev/null <<ENV
+spinner_start "Konfiguration" "Schreibe .env..."
+write_ct_file /opt/cryptomator-hub/.env 0600 <<ENV
 # Cryptomator Hub deployment (.env)
 # WICHTIG: Diese Datei enthaelt Secrets. Nicht in Git einchecken.
 
@@ -611,12 +624,14 @@ REALM_ADMIN_TEMPORARY=${REALM_ADMIN_TEMP}
 QUARKUS_HTTP_HEADER__CONTENT_SECURITY_POLICY__VALUE=${CSP}
 ENV
 [[ $? -eq 0 ]] || die ".env konnte nicht geschrieben werden."
+spinner_stop
 
 ############################################
 # realm.json (nur interner Keycloak)        #
 ############################################
 if [[ "$KC_MODE" == "internal" ]]; then
-  pct exec "$CTID" -- tee /opt/cryptomator-hub/kc-import/realm.json > /dev/null <<REALM
+  spinner_start "Konfiguration" "Schreibe realm.json..."
+  write_ct_file /opt/cryptomator-hub/kc-import/realm.json <<REALM
 {
   "id": "cryptomator",
   "realm": "${REALM_NAME}",
@@ -720,6 +735,7 @@ if [[ "$KC_MODE" == "internal" ]]; then
 }
 REALM
   [[ $? -eq 0 ]] || die "realm.json konnte nicht geschrieben werden."
+  spinner_stop
 fi
 
 ############################################
@@ -727,8 +743,9 @@ fi
 # Single-quoted Heredoc: $ bleibt erhalten #
 # damit docker-compose die Vars liest.     #
 ############################################
+spinner_start "Konfiguration" "Schreibe compose.yml..."
 if [[ "$KC_MODE" == "internal" ]]; then
-  pct exec "$CTID" -- tee /opt/cryptomator-hub/compose.yml > /dev/null <<'COMPOSE'
+  write_ct_file /opt/cryptomator-hub/compose.yml <<'COMPOSE'
 services:
   postgres:
     image: ${POSTGRES_IMAGE}
@@ -805,7 +822,7 @@ COMPOSE
 
 else
 
-  pct exec "$CTID" -- tee /opt/cryptomator-hub/compose.yml > /dev/null <<'COMPOSE'
+  write_ct_file /opt/cryptomator-hub/compose.yml <<'COMPOSE'
 services:
   postgres:
     image: ${POSTGRES_IMAGE}
@@ -850,11 +867,17 @@ services:
 COMPOSE
   [[ $? -eq 0 ]] || die "compose.yml (extern) konnte nicht geschrieben werden."
 fi
+spinner_stop
 
 ############################################
 # Deploy                                     #
 ############################################
-spinner_start "Deploy" "Starte Docker Compose Stack (Images werden gepullt, kann einige Minuten dauern)..."
+spinner_start "Deploy" "Lade Docker Images (kann einige Minuten dauern)..."
+exec_ct "cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml pull" >>"$_INSTALL_LOG" 2>&1
+_rc=$?; spinner_stop
+[[ $_rc -eq 0 ]] || die "docker compose pull fehlgeschlagen. Log: $_INSTALL_LOG"
+
+spinner_start "Deploy" "Starte Container (Keycloak braucht beim ersten Start bis zu 2-3 Minuten)..."
 exec_ct "cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml up -d" >>"$_INSTALL_LOG" 2>&1
 _rc=$?; spinner_stop
 [[ $_rc -eq 0 ]] || die "docker compose up fehlgeschlagen. Pruefe: pct enter ${CTID} -> cd /opt/cryptomator-hub && docker compose logs"
@@ -862,13 +885,19 @@ _rc=$?; spinner_stop
 ############################################
 # Status-Check nach Deploy                   #
 ############################################
-sleep 5
+sleep 10
 RUNNING_COUNT="$(exec_ct \
   "docker compose -f /opt/cryptomator-hub/compose.yml ps --status running --quiet 2>/dev/null | wc -l" \
   2>/dev/null || echo "0")"
 
-if [[ "${RUNNING_COUNT:-0}" -eq 0 ]]; then
-  _MSG_WARN=$'Docker Compose wurde gestartet, aber es konnten keine laufenden\nContainer bestaetigt werden.\n\nKeycloak braucht beim ersten Start bis zu 2 Minuten.\n\nPruefe manuell:\n  pct enter '"${CTID}"$'\n  cd /opt/cryptomator-hub\n  docker compose ps\n  docker compose logs --tail=50'
+if [[ "$KC_MODE" == "internal" ]]; then
+  _expected=3
+else
+  _expected=2
+fi
+
+if [[ "${RUNNING_COUNT:-0}" -lt "$_expected" ]]; then
+  _MSG_WARN=$'Docker Compose wurde gestartet, aber nicht alle Container laufen.\n('"${RUNNING_COUNT:-0}"' von '"${_expected}"$' erwartet)\n\nKeycloak braucht beim ersten Start bis zu 2-3 Minuten.\n\nPruefe manuell:\n  pct enter '"${CTID}"$'\n  cd /opt/cryptomator-hub\n  docker compose ps\n  docker compose logs --tail=50'
   msgbox "Warnung" "$_MSG_WARN"
 fi
 
