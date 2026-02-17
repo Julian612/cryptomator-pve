@@ -486,7 +486,7 @@ pct start "$CTID" || die "pct start fehlgeschlagen."
 spinner_start "LXC" "Warte auf Container-Start..."
 _ct_ready=0
 for _i in $(seq 1 30); do
-  if pct exec "$CTID" -- true 2>/dev/null; then
+  if pct exec "$CTID" -- true </dev/null 2>/dev/null; then
     _ct_ready=1
     break
   fi
@@ -499,7 +499,9 @@ spinner_stop
 # exec_ct – ab hier verfügbar              #
 ############################################
 exec_ct() {
-  pct exec "$CTID" -- bash -lc "$1"
+  # </dev/null verhindert, dass pct exec auf stdin haengt
+  # (bekanntes Problem bei manchen PVE-Versionen)
+  pct exec "$CTID" -- bash -lc "$1" </dev/null
 }
 
 # write_ct_file – schreibt Datei via base64 in den Container.
@@ -524,11 +526,11 @@ sleep 20
 spinner_stop
 
 spinner_start "Bootstrap" "apt-get update..."
-exec_ct "apt-get update -y" >>"$_INSTALL_LOG" 2>&1
+exec_ct "DEBIAN_FRONTEND=noninteractive apt-get update -y" >>"$_INSTALL_LOG" 2>&1
 _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "apt-get update fehlgeschlagen. Log: $_INSTALL_LOG"
 
 spinner_start "Bootstrap" "Installiere Docker (ca. 1-2 Minuten)..."
-exec_ct "apt-get install -y ca-certificates curl gnupg docker.io docker-compose-plugin" >>"$_INSTALL_LOG" 2>&1
+exec_ct "DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg docker.io docker-compose-plugin" >>"$_INSTALL_LOG" 2>&1
 _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Installation fehlgeschlagen. Log: $_INSTALL_LOG"
 
 spinner_start "Bootstrap" "Starte Docker Service..."
