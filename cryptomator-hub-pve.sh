@@ -235,7 +235,7 @@ next_free_ctid() {
 get_lxc_ip() {
   local ctid="$1" ip="" attempts=0
   while [[ -z "$ip" && $attempts -lt 20 ]]; do
-    ip="$(pct exec "$ctid" -- hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    ip="$(lxc-attach -n "$ctid" -- hostname -I </dev/null 2>/dev/null | awk '{print $1}' || true)"
     [[ -n "$ip" ]] && break
     sleep 2
     attempts=$(( attempts + 1 ))
@@ -486,7 +486,7 @@ pct start "$CTID" || die "pct start fehlgeschlagen."
 spinner_start "LXC" "Warte auf Container-Start..."
 _ct_ready=0
 for _i in $(seq 1 30); do
-  if pct exec "$CTID" -- true </dev/null 2>/dev/null; then
+  if lxc-attach -n "$CTID" -- true </dev/null 2>/dev/null; then
     _ct_ready=1
     break
   fi
@@ -499,9 +499,9 @@ spinner_stop
 # exec_ct – ab hier verfügbar              #
 ############################################
 exec_ct() {
-  # </dev/null verhindert, dass pct exec auf stdin haengt
-  # (bekanntes Problem bei manchen PVE-Versionen)
-  pct exec "$CTID" -- bash -lc "$1" </dev/null
+  # lxc-attach statt pct exec: zuverlaessiger bei langen Befehlen,
+  # kein internes TTY-Allokieren. </dev/null verhindert stdin-Blockaden.
+  lxc-attach -n "$CTID" -- bash -c "$1" </dev/null
 }
 
 # write_ct_file – schreibt Datei via base64 in den Container.
