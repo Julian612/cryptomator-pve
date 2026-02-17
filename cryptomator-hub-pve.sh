@@ -153,10 +153,11 @@ fi
 ############################################
 # Storage-Auswahl per Menü                  #
 ############################################
-pick_storage() {
+# Template-Storage (vztmpl)
+pick_tmpl_storage() {
   local menu_args=()
   while IFS= read -r stor; do
-    [[ -n "$stor" ]] && menu_args+=("$stor" "LXC Template Storage")
+    [[ -n "$stor" ]] && menu_args+=("$stor" "Template Storage")
   done < <(pvesm status -content vztmpl | awk 'NR>1 {print $1}')
 
   [[ ${#menu_args[@]} -gt 0 ]] || \
@@ -165,7 +166,24 @@ pick_storage() {
   if [[ ${#menu_args[@]} -eq 2 ]]; then
     echo "${menu_args[0]}"
   else
-    menulist "Storage" "Storage fuer LXC Template und Rootfs waehlen:" 16 78 8 "${menu_args[@]}"
+    menulist "Storage (Template)" "Storage fuer LXC Template-Download:" 16 78 8 "${menu_args[@]}"
+  fi
+}
+
+# Rootfs-Storage (rootdir) – muss Container-Verzeichnisse unterstuetzen
+pick_rootfs_storage() {
+  local menu_args=()
+  while IFS= read -r stor; do
+    [[ -n "$stor" ]] && menu_args+=("$stor" "Rootfs Storage")
+  done < <(pvesm status -content rootdir | awk 'NR>1 {print $1}')
+
+  [[ ${#menu_args[@]} -gt 0 ]] || \
+    die "Kein Storage mit Content 'rootdir' gefunden.\nPruefe pvesm status.\nTypisch: local-lvm, local-zfs oder ein NFS/ZFS Storage mit rootdir."
+
+  if [[ ${#menu_args[@]} -eq 2 ]]; then
+    echo "${menu_args[0]}"
+  else
+    menulist "Storage (Rootfs)" "Storage fuer LXC Rootfs (Container-Disk):" 16 78 8 "${menu_args[@]}"
   fi
 }
 
@@ -394,14 +412,15 @@ yesno "Bestaetigung" "$_MSG_CONFIRM" || { echo "Abgebrochen."; exit 0; }
 ############################################
 # Storage / Template                        #
 ############################################
-STORAGE="$(pick_storage)"
+TMPL_STORAGE="$(pick_tmpl_storage)"
+ROOTFS_STORAGE="$(pick_rootfs_storage)"
 TEMPLATE="$(latest_debian12_template)"
 if [[ -z "$TEMPLATE" ]]; then
   # pveam available nochmal mit Output fuer Diagnose
   _avail="$(pveam available --section system 2>&1 | head -20 || true)"
   die "Kein debian-12-standard Template gefunden.\n\npveam available Output:\n${_avail}"
 fi
-ensure_template "$STORAGE" "$TEMPLATE"
+ensure_template "$TMPL_STORAGE" "$TEMPLATE"
 
 ############################################
 # LXC erstellen                             #
@@ -419,7 +438,7 @@ if [[ "$NET_MODE" == "static" ]]; then
     --cores       "$CORES"
     --memory      "$RAM"
     --swap        "$SWAP"
-    --rootfs      "${STORAGE}:${DISK}"
+    --rootfs      "${ROOTFS_STORAGE}:${DISK}"
     --net0        "$NET0"
     --nameserver  "$STATIC_DNS"
     --features    "nesting=1,keyctl=1"
@@ -435,7 +454,7 @@ else
     --cores       "$CORES"
     --memory      "$RAM"
     --swap        "$SWAP"
-    --rootfs      "${STORAGE}:${DISK}"
+    --rootfs      "${ROOTFS_STORAGE}:${DISK}"
     --net0        "$NET0"
     --features    "nesting=1,keyctl=1"
     --unprivileged 1
@@ -446,7 +465,7 @@ else
 fi
 
 spinner_start "LXC" "Erstelle Container ${CTID} (${HOSTNAME})..."
-pct create "$CTID" "${STORAGE}:vztmpl/${TEMPLATE}" "${PCT_CREATE_ARGS[@]}" >>"$_INSTALL_LOG" 2>&1
+pct create "$CTID" "${TMPL_STORAGE}:vztmpl/${TEMPLATE}" "${PCT_CREATE_ARGS[@]}" >>"$_INSTALL_LOG" 2>&1
 _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "pct create fehlgeschlagen. Log: $_INSTALL_LOG"
 
 pct start "$CTID" || die "pct start fehlgeschlagen."
