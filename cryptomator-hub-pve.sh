@@ -170,20 +170,29 @@ pick_tmpl_storage() {
   fi
 }
 
-# Rootfs-Storage (rootdir) – muss Container-Verzeichnisse unterstuetzen
+# Rootfs-Storage – zeigt alle verfuegbaren Storages mit Typ zur manuellen Auswahl.
+# Kein Filter nach rootdir, da pvesm die Inhaltstypen unterschiedlich meldet.
 pick_rootfs_storage() {
   local menu_args=()
-  while IFS= read -r stor; do
-    [[ -n "$stor" ]] && menu_args+=("$stor" "Rootfs Storage")
-  done < <(pvesm status -content rootdir | awk 'NR>1 {print $1}')
+  # Alle Storages einlesen mit Typ als Beschreibung (Spalten: Name Typ ...)
+  while IFS= read -r line; do
+    local sname stype
+    sname="$(echo "$line" | awk '{print $1}')"
+    stype="$(echo "$line" | awk '{print $2}')"
+    [[ -n "$sname" ]] && menu_args+=("$sname" "[$stype]")
+  done < <(pvesm status 2>/dev/null | awk 'NR>1')
 
-  [[ ${#menu_args[@]} -gt 0 ]] || \
-    die "Kein Storage mit Content 'rootdir' gefunden.\nPruefe pvesm status.\nTypisch: local-lvm, local-zfs oder ein NFS/ZFS Storage mit rootdir."
+  if [[ ${#menu_args[@]} -eq 0 ]]; then
+    # Absoluter Fallback: manuelle Eingabe
+    inputbox "Storage" "Kein Storage gefunden.\nBitte Storage-Name manuell eingeben (z.B. local-lvm):" "local-lvm"
+    return
+  fi
 
   if [[ ${#menu_args[@]} -eq 2 ]]; then
+    # Nur ein Storage – direkt nehmen
     echo "${menu_args[0]}"
   else
-    menulist "Storage (Rootfs)" "Storage fuer LXC Rootfs (Container-Disk):" 16 78 8 "${menu_args[@]}"
+    menulist "Storage (Container-Disk)"       "Storage fuer LXC Container-Disk waehlen.\nHinweis: local = nur Templates, local-lvm/local-zfs = Container."       20 78 12 "${menu_args[@]}"
   fi
 }
 
