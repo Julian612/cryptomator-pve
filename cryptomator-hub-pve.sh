@@ -486,7 +486,7 @@ pct start "$CTID" || die "pct start fehlgeschlagen."
 spinner_start "LXC" "Warte auf Container-Start..."
 _ct_ready=0
 for _i in $(seq 1 30); do
-  if lxc-attach -n "$CTID" -- true </dev/null 2>/dev/null; then
+  if lxc-attach -n "$CTID" -- true </dev/null >/dev/null 2>/dev/null; then
     _ct_ready=1
     break
   fi
@@ -501,8 +501,11 @@ spinner_stop
 exec_ct() {
   # lxc-attach statt pct exec: zuverlaessiger bei langen Befehlen,
   # kein internes TTY-Allokieren. </dev/null verhindert stdin-Blockaden.
-  # TERM=dumb unterdrueckt Terminal-Escape-Codes, die das whiptail-Display stoeren.
-  lxc-attach -n "$CTID" -- env TERM=dumb DEBIAN_FRONTEND=noninteractive bash -c "$1" </dev/null
+  # TERM=dumb + NO_COLOR unterdrueckt Terminal-Escape-Codes.
+  # stderr -> Logdatei: lxc-attach gibt eigene Meldungen auf stderr aus
+  # (cgroup-Warnungen, Namespace-Infos etc.), die das whiptail-Display stoeren.
+  lxc-attach -n "$CTID" -- env TERM=dumb DEBIAN_FRONTEND=noninteractive NO_COLOR=1 \
+    bash -c "$1" </dev/null 2>>"$_INSTALL_LOG"
 }
 
 # write_ct_file – schreibt Datei via base64 in den Container.
@@ -514,7 +517,8 @@ write_ct_file() {
   local dest="$1" mode="${2:-0644}"
   local b64
   b64="$(base64 -w0)"
-  exec_ct "printf '%s' '${b64}' | base64 -d > '${dest}' && chmod ${mode} '${dest}'"
+  # stdout auch ins Log: verhindert dass stray-Output von lxc-attach das Display stoert
+  exec_ct "printf '%s' '${b64}' | base64 -d > '${dest}' && chmod ${mode} '${dest}'" >>"$_INSTALL_LOG"
 }
 
 ############################################
@@ -544,7 +548,7 @@ _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Service konnte nicht gesta
 exec_ct "mkdir -p \
   /opt/cryptomator-hub/data/db-init \
   /opt/cryptomator-hub/data/db-data \
-  /opt/cryptomator-hub/kc-import" \
+  /opt/cryptomator-hub/kc-import" >>"$_INSTALL_LOG" \
   || die "Verzeichnisse konnten nicht angelegt werden."
 
 ############################################
@@ -887,10 +891,15 @@ _rc=$?; spinner_stop
 ############################################
 # Status-Check nach Deploy                   #
 ############################################
+spinner_start "Status" "Warte auf Container-Start (ca. 10s)..."
 sleep 10
+spinner_stop
+
+spinner_start "Status" "Pruefe laufende Container..."
 RUNNING_COUNT="$(exec_ct \
   "docker compose -f /opt/cryptomator-hub/compose.yml ps --status running --quiet 2>/dev/null | wc -l" \
-  2>/dev/null || echo "0")"
+  || echo "0")"
+spinner_stop
 
 if [[ "$KC_MODE" == "internal" ]]; then
   _expected=3
@@ -906,7 +915,9 @@ fi
 ############################################
 # LXC-IP ermitteln                          #
 ############################################
+spinner_start "Netzwerk" "Ermittle LXC IP-Adresse..."
 LXC_IP="$(get_lxc_ip "$CTID")"
+spinner_stop
 
 ############################################
 # Abschluss-Zusammenfassung                 #
