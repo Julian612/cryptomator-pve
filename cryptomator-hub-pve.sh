@@ -505,50 +505,11 @@ exec_ct() {
 ############################################
 # Bootstrap im Container                    #
 ############################################
-# Warten bis Netzwerk im Container bereit ist (DHCP braucht einige Sekunden)
-spinner_start "Netzwerk" "Warte auf Netzwerk im Container..."
-_net_ready=0
-for _i in $(seq 1 15); do
-  if exec_ct "ip route show default 2>/dev/null | grep -q default" 2>/dev/null; then
-    _net_ready=1
-    break
-  fi
-  sleep 2
-done
+# Feste Wartezeit damit DHCP und Netz sich stabilisieren koennen.
+# Kein DNS-Vorcheck – apt-get gibt eine klare Fehlermeldung wenn Netz fehlt.
+spinner_start "Netzwerk" "Warte 20s auf Netzwerk-Initialisierung im Container..."
+sleep 20
 spinner_stop
-
-# DNS-Check mit Retry (5 Versuche, je 3 Sekunden Abstand)
-_dns_ok=0
-for _i in $(seq 1 5); do
-  if exec_ct "getent hosts deb.debian.org >/dev/null 2>&1" 2>/dev/null; then
-    _dns_ok=1
-    break
-  fi
-  sleep 3
-done
-
-if [[ $_dns_ok -eq 0 ]]; then
-  _ct_resolv="$(pct exec "$CTID" -- cat /etc/resolv.conf 2>/dev/null || echo "nicht lesbar")"
-  _ct_route="$(pct exec "$CTID" -- ip route 2>/dev/null || echo "nicht lesbar")"
-  _MSG_DNS=$'DNS-Aufloesung im Container fehlgeschlagen.
-
-/etc/resolv.conf im Container:
-'
-  _MSG_DNS+="$_ct_resolv"
-  _MSG_DNS+=$'
-
-Routen:
-'
-  _MSG_DNS+="$_ct_route"
-  _MSG_DNS+=$'
-
-Container wird gestoppt.
-Pruefe Bridge und DNS-Konfiguration.'
-  msgbox "Netz/DNS Problem" "$_MSG_DNS"
-  pct stop "$CTID" || true
-  exit 1
-fi
-
 
 spinner_start "Bootstrap" "apt-get update..."
 exec_ct "apt-get update -y" >>"$_INSTALL_LOG" 2>&1
