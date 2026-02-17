@@ -53,6 +53,10 @@ tput cnorm >/dev/null 2>&1 || true
 die() { echo "ERROR: $*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Befehl fehlt: $1"; }
 
+# WICHTIG: whiptail interpretiert \n in Strings NICHT automatisch als Newline.
+# Alle mehrzeiligen Texte werden deshalb als Variablen mit $'...' (ANSI-C Quoting)
+# definiert. Nur so entstehen echte Newlines im String.
+
 msgbox() { whiptail --title "${1:-Info}" --msgbox "${2:-}" 14 78; }
 yesno()  { whiptail --title "${1:-Frage}" --yesno "${2:-}" 12 78; }
 
@@ -80,21 +84,15 @@ menulist() {
   whiptail --title "$title" --menu "$prompt" "$height" "$width" "$listheight" "$@" 3>&1 1>&2 2>&3
 }
 
-# Spinner: zeigt animierten Fortschrittsbalken während ein Befehl läuft.
-# Befehl wird direkt in der aktuellen Shell ausgeführt (keine Subshell),
-# damit Shell-Funktionen wie exec_ct erreichbar bleiben.
-# Verwendung: spinner_msg "Titel" "Nachricht" && { befehl; spinner_done; }
-# Einfachere Variante für direkte Befehle (keine Shell-Funktionen):
+# Spinner: FIFO-basiert, läuft in aktueller Shell damit exec_ct erreichbar bleibt.
 spinner_start() {
   local title="$1" msg="$2"
-  # Starte Gauge im Hintergrund – liest von einer FIFO
   _SPINNER_FIFO="$(mktemp -u /tmp/spinner_XXXXXX)"
   mkfifo "$_SPINNER_FIFO"
   whiptail --title "$title" --gauge "$msg" 8 78 0 < "$_SPINNER_FIFO" &
   _SPINNER_PID=$!
-  # Schreib-Ende der FIFO öffnen damit whiptail nicht sofort EOF bekommt
   exec 9>"$_SPINNER_FIFO"
-  # Animationsloop im Hintergrund (kein 'local' – wir sind in einer Subshell, nicht Funktion)
+  # Animationsloop in Subshell – kein 'local', da außerhalb einer Funktion
   (
     s=0
     while kill -0 "$_SPINNER_PID" 2>/dev/null; do
@@ -107,26 +105,12 @@ spinner_start() {
 }
 
 spinner_stop() {
-  # Gauge beenden
   echo "100" >&9 2>/dev/null || true
   exec 9>&- 2>/dev/null || true
   kill "$_SPINNER_ANIM_PID" 2>/dev/null || true
-  wait "$_SPINNER_PID"    2>/dev/null || true
+  wait "$_SPINNER_PID"      2>/dev/null || true
   wait "$_SPINNER_ANIM_PID" 2>/dev/null || true
-  rm -f "$_SPINNER_FIFO"   2>/dev/null || true
-}
-
-# Wrapper: spinner_run "Titel" "Msg" cmd [args...]
-# Funktioniert nur für externe Befehle (nicht für Shell-Funktionen).
-# Für Shell-Funktionen: spinner_start / spinner_stop manuell verwenden.
-spinner_run() {
-  local title="$1" msg="$2"
-  shift 2
-  spinner_start "$title" "$msg"
-  "$@"
-  local rc=$?
-  spinner_stop
-  return $rc
+  rm -f "$_SPINNER_FIFO"    2>/dev/null || true
 }
 
 is_int()   { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
@@ -144,7 +128,7 @@ need_cmd awk
 need_cmd openssl
 
 if [[ "${EUID}" -ne 0 ]]; then
-  die "Bitte als root auf dem Proxmox Host ausführen."
+  die "Bitte als root auf dem Proxmox Host ausfuehren."
 fi
 
 ############################################
@@ -157,13 +141,12 @@ pick_storage() {
   done < <(pvesm status -content vztmpl | awk 'NR>1 {print $1}')
 
   [[ ${#menu_args[@]} -gt 0 ]] || \
-    die "Kein Storage mit Content 'vztmpl' gefunden. Prüfe pvesm status."
+    die "Kein Storage mit Content 'vztmpl' gefunden. Pruefe pvesm status."
 
   if [[ ${#menu_args[@]} -eq 2 ]]; then
-    # Nur ein Storage vorhanden – direkt nehmen
     echo "${menu_args[0]}"
   else
-    menulist "Storage" "Storage für LXC Template und Rootfs wählen:" 16 78 8 "${menu_args[@]}"
+    menulist "Storage" "Storage fuer LXC Template und Rootfs waehlen:" 16 78 8 "${menu_args[@]}"
   fi
 }
 
@@ -181,9 +164,10 @@ latest_debian12_template() {
 ensure_template() {
   local storage="$1" tmpl="$2"
   if ! pveam list "$storage" | awk '{print $1}' | grep -qx "$tmpl"; then
-    msgbox "Template Download" \
-"Debian Template nicht lokal vorhanden.\n\nLade herunter:\n${tmpl}\n\nStorage: ${storage}\n\nDies kann einige Minuten dauern…"
-    spinner_start "Template Download" "Lade ${tmpl}…"
+    local msg
+    msg=$'Debian Template nicht lokal vorhanden.\n\nLade herunter:\n'"${tmpl}"$'\n\nStorage: '"${storage}"$'\n\nDies kann einige Minuten dauern...'
+    msgbox "Template Download" "$msg"
+    spinner_start "Template Download" "Lade ${tmpl}..."
     pveam download "$storage" "$tmpl"
     local rc=$?
     spinner_stop
@@ -199,7 +183,7 @@ next_free_ctid() {
 }
 
 ############################################
-# LXC-IP ermitteln (wartet bis IP da ist)   #
+# LXC-IP ermitteln                          #
 ############################################
 get_lxc_ip() {
   local ctid="$1" ip="" attempts=0
@@ -217,21 +201,15 @@ get_lxc_ip() {
 ############################################
 BACKTITLE="Cryptomator Hub Installer (PVE Helper-artig)"
 
-whiptail --backtitle "$BACKTITLE" --title "Cryptomator Hub" --msgbox \
-"Dieses Script erstellt einen Debian LXC Container und deployt:\n\n\
-  - Cryptomator Hub\n\
-  - Postgres\n\
-  - Optional: Keycloak (intern)\n\n\
-Du kannst zwischen 'Standard' (Defaults) und 'Erweitert' wählen.\n\
-Im Standard-Modus werden nur die wichtigsten Werte abgefragt." \
-16 78
+_MSG_WELCOME=$'Dieses Script erstellt einen Debian LXC Container und deployt:\n\n  - Cryptomator Hub\n  - Postgres\n  - Optional: Keycloak (intern)\n\nDu kannst zwischen Standard (Defaults) und Erweitert waehlen.\nIm Standard-Modus werden nur die wichtigsten Werte abgefragt.'
+whiptail --backtitle "$BACKTITLE" --title "Cryptomator Hub" --msgbox "$_MSG_WELCOME" 16 78
 
 ############################################
 # Standard vs. Erweitert                    #
 ############################################
-INSTALL_MODE="$(radiolist "Installationsmodus" "Modus wählen:" 12 78 2 \
-  "standard"  "Standard  – sinnvolle Defaults, minimale Eingaben (empfohlen)" ON \
-  "advanced"  "Erweitert – alle Parameter manuell konfigurieren" OFF \
+INSTALL_MODE="$(radiolist "Installationsmodus" "Modus waehlen:" 12 78 2 \
+  "standard"  "Standard  - sinnvolle Defaults, minimale Eingaben (empfohlen)" ON \
+  "advanced"  "Erweitert - alle Parameter manuell konfigurieren" OFF \
 )" || exit 1
 
 # Defaults
@@ -254,36 +232,31 @@ DEFAULT_REALM_ADMIN="admin"
 DEFAULT_OIDC_CLIENT="cryptomatorhub"
 DEFAULT_SYSTEM_CLIENT="cryptomatorhub-system"
 
-# Statisches Netz: nur im erweiterten Modus konfigurierbar
 NET_MODE="dhcp"
 STATIC_IP="" STATIC_GW="" STATIC_DNS=""
 
 if [[ "$INSTALL_MODE" == "standard" ]]; then
-  # ---- STANDARD: nur das Nötigste ----
+  # ---- STANDARD ----
 
-  CTID="$(inputbox "Container" "CTID (nächste freie ID vorausgefüllt):" "$DEFAULT_CTID")" || exit 1
+  CTID="$(inputbox "Container" "CTID (naechste freie ID vorausgefuellt):" "$DEFAULT_CTID")" || exit 1
   is_int "$CTID" || die "CTID muss numerisch sein."
 
   HOSTNAME="$(inputbox "Container" "LXC Hostname:" "$DEFAULT_HOSTNAME")" || exit 1
 
-  msgbox "Keycloak Modus" \
-"- Intern: Script richtet Realm/Clients/Mapper automatisch ein.\n\
-- Extern: Alles muss manuell korrekt konfiguriert werden.\n\n\
-Typische Fehler bei Extern: 401/403, weisse UI.\n\
-Empfehlung: Intern wählen."
+  _MSG_KC=$'Keycloak Modus:\n\n- Intern: Script richtet Realm/Clients/Mapper automatisch ein.\n- Extern: Alles muss manuell korrekt konfiguriert werden.\n\nTypische Fehler bei Extern: 401/403, weisse UI.\nEmpfehlung: Intern waehlen.'
+  msgbox "Keycloak Modus" "$_MSG_KC"
 
   KC_MODE="$(radiolist "Keycloak" "Keycloak Deployment:" 12 78 2 \
     "internal" "Keycloak im selben LXC deployen (empfohlen)" ON \
-    "external" "Externen Keycloak verwenden (manuelle Konfig nötig)" OFF \
+    "external" "Externen Keycloak verwenden (manuelle Konfig noetig)" OFF \
   )" || exit 1
 
-  HUB_PUBLIC_BASE="$(inputbox "URLs" "Hub Public Base URL\n(z.B. https://hub.example.tld):" "https://hub.example.tld")" || exit 1
-  KC_PUBLIC_BASE="$(inputbox  "URLs" "Keycloak Public Base URL\n(OHNE /kc, z.B. https://auth.example.tld):" "https://auth.example.tld")" || exit 1
+  HUB_PUBLIC_BASE="$(inputbox "URLs" "Hub Public Base URL (z.B. https://hub.example.tld):" "https://hub.example.tld")" || exit 1
+  KC_PUBLIC_BASE="$(inputbox  "URLs" "Keycloak Public Base URL ohne /kc (z.B. https://auth.example.tld):" "https://auth.example.tld")" || exit 1
 
   REALM_ADMIN_PW="$(passwordbox "Realm" "Initiales Realm-Admin Passwort:")" || exit 1
   [[ -n "$REALM_ADMIN_PW" ]] || die "Realm-Admin Passwort darf nicht leer sein."
 
-  # Restliche Werte aus Defaults
   TZ="$DEFAULT_TZ"
   CORES="$DEFAULT_CORES"
   RAM="$DEFAULT_RAM"
@@ -304,7 +277,7 @@ Empfehlung: Intern wählen."
   REALM_ADMIN_TEMP="true"
 
 else
-  # ---- ERWEITERT: alles konfigurierbar ----
+  # ---- ERWEITERT ----
 
   CTID="$(inputbox "Container" "CTID (numerisch):" "$DEFAULT_CTID")" || exit 1
   is_int "$CTID" || die "CTID muss numerisch sein."
@@ -312,18 +285,14 @@ else
   HOSTNAME="$(inputbox "Container" "LXC Hostname:" "$DEFAULT_HOSTNAME")" || exit 1
   TZ="$(inputbox "Container" "Zeitzone im LXC:" "$DEFAULT_TZ")" || exit 1
 
-  msgbox "Keycloak Modus" \
-"- Intern: Script richtet Realm/Clients/Mapper automatisch ein.\n\
-- Extern: Du musst Realm/Clients/Mapper/Secrets selbst korrekt konfigurieren.\n\n\
-Typische Fehler: 401/403, weisse UI, fehlende Rollen im Token.\n\
-Empfehlung: Intern wählen."
+  _MSG_KC=$'Keycloak Modus:\n\n- Intern: Script richtet Realm/Clients/Mapper automatisch ein.\n- Extern: Du musst Realm/Clients/Mapper/Secrets selbst korrekt konfigurieren.\n\nTypische Fehler: 401/403, weisse UI, fehlende Rollen im Token.\nEmpfehlung: Intern waehlen.'
+  msgbox "Keycloak Modus" "$_MSG_KC"
 
   KC_MODE="$(radiolist "Keycloak" "Keycloak Deployment auswählen:" 14 78 2 \
     "internal" "Keycloak im selben LXC deployen (empfohlen)" ON \
-    "external" "Externen Keycloak verwenden (manuelle Konfiguration nötig)" OFF \
+    "external" "Externen Keycloak verwenden (manuelle Konfiguration noetig)" OFF \
   )" || exit 1
 
-  # Ressourcen
   CORES="$(inputbox "Ressourcen" "CPU Cores:" "$DEFAULT_CORES")" || exit 1
   is_int "$CORES" || die "CPU Cores muss numerisch sein."
   RAM="$(inputbox "Ressourcen" "RAM (MB):" "$DEFAULT_RAM")" || exit 1
@@ -333,12 +302,11 @@ Empfehlung: Intern wählen."
   SWAP="$(inputbox "Ressourcen" "Swap (MB):" "$DEFAULT_SWAP")" || exit 1
   is_int "$SWAP" || die "Swap muss numerisch sein."
 
-  # Netzwerk
   BRIDGE="$(inputbox "Netzwerk" "Network Bridge:" "$DEFAULT_BRIDGE")" || exit 1
 
   NET_MODE="$(radiolist "Netzwerk" "Netzwerk-Konfiguration:" 12 78 2 \
     "dhcp"   "DHCP (empfohlen)" ON \
-    "static" "Statisch – IP/GW/DNS manuell eingeben" OFF \
+    "static" "Statisch - IP/GW/DNS manuell eingeben" OFF \
   )" || exit 1
 
   if [[ "$NET_MODE" == "static" ]]; then
@@ -349,22 +317,19 @@ Empfehlung: Intern wählen."
     STATIC_DNS="$(inputbox "Netzwerk" "DNS Server (z.B. 1.1.1.1):" "1.1.1.1")" || exit 1
   fi
 
-  # Ports
-  BIND_IP="$(inputbox "Ports" "Bind IP\n(0.0.0.0 = LAN, 127.0.0.1 = nur lokal):" "$DEFAULT_BINDIP")" || exit 1
+  BIND_IP="$(inputbox "Ports" "Bind IP (0.0.0.0 = LAN, 127.0.0.1 = nur lokal):" "$DEFAULT_BINDIP")" || exit 1
 
-  KC_BIND_PORT="$(inputbox "Ports" "Keycloak Host-Port (→ Container 8080):" "$DEFAULT_KC_PORT")" || exit 1
+  KC_BIND_PORT="$(inputbox "Ports" "Keycloak Host-Port (-> Container 8080):" "$DEFAULT_KC_PORT")" || exit 1
   is_int "$KC_BIND_PORT" || die "Keycloak Port muss numerisch sein."
 
-  HUB_BIND_PORT="$(inputbox "Ports" "Hub Host-Port (→ Container 8080):" "$DEFAULT_HUB_PORT")" || exit 1
+  HUB_BIND_PORT="$(inputbox "Ports" "Hub Host-Port (-> Container 8080):" "$DEFAULT_HUB_PORT")" || exit 1
   is_int "$HUB_BIND_PORT" || die "Hub Port muss numerisch sein."
 
-  [[ "$KC_BIND_PORT" != "$HUB_BIND_PORT" ]] || die "Keycloak Port und Hub Port dürfen nicht identisch sein."
+  [[ "$KC_BIND_PORT" != "$HUB_BIND_PORT" ]] || die "Keycloak Port und Hub Port duerfen nicht identisch sein."
 
-  # URLs
-  HUB_PUBLIC_BASE="$(inputbox "URLs" "Hub Public Base URL\n(z.B. https://hub.example.tld):" "https://hub.example.tld")" || exit 1
-  KC_PUBLIC_BASE="$(inputbox  "URLs" "Keycloak Public Base URL\n(OHNE /kc, z.B. https://auth.example.tld):" "https://auth.example.tld")" || exit 1
+  HUB_PUBLIC_BASE="$(inputbox "URLs" "Hub Public Base URL (z.B. https://hub.example.tld):" "https://hub.example.tld")" || exit 1
+  KC_PUBLIC_BASE="$(inputbox  "URLs" "Keycloak Public Base URL ohne /kc (z.B. https://auth.example.tld):" "https://auth.example.tld")" || exit 1
 
-  # Images
   POSTGRES_IMAGE="$(inputbox "Images" "Postgres Image:" "$DEFAULT_PG_IMAGE")" || exit 1
   [[ -n "$POSTGRES_IMAGE" ]] || POSTGRES_IMAGE="$DEFAULT_PG_IMAGE"
   HUB_IMAGE="$(inputbox "Images" "Hub Image:" "$DEFAULT_HUB_IMAGE")" || exit 1
@@ -372,19 +337,17 @@ Empfehlung: Intern wählen."
   KEYCLOAK_IMAGE="$(inputbox "Images" "Keycloak Image:" "$DEFAULT_KC_IMAGE")" || exit 1
   [[ -n "$KEYCLOAK_IMAGE" ]] || KEYCLOAK_IMAGE="$DEFAULT_KC_IMAGE"
 
-  # OIDC
   HUB_OIDC_CLIENT_ID="$(inputbox "OIDC" "OIDC Client ID (Hub) in Keycloak:" "$DEFAULT_OIDC_CLIENT")" || exit 1
-  HUB_SYSTEM_CLIENT_ID="$(inputbox "OIDC" "System Client ID für Hub-Sync:" "$DEFAULT_SYSTEM_CLIENT")" || exit 1
+  HUB_SYSTEM_CLIENT_ID="$(inputbox "OIDC" "System Client ID fuer Hub-Sync:" "$DEFAULT_SYSTEM_CLIENT")" || exit 1
   HUB_REDIRECT_URI="$(inputbox "OIDC" "Hub Redirect URI:" "${HUB_PUBLIC_BASE}/*")" || exit 1
 
-  # Realm
   REALM_NAME="$(inputbox "Realm" "Realm Name:" "$DEFAULT_REALM")" || exit 1
   REALM_ADMIN_USER="$(inputbox "Realm" "Initialer Realm-Admin Username:" "$DEFAULT_REALM_ADMIN")" || exit 1
   REALM_ADMIN_PW="$(passwordbox "Realm" "Initiales Realm-Admin Passwort:")" || exit 1
   [[ -n "$REALM_ADMIN_PW" ]] || die "Realm-Admin Passwort darf nicht leer sein."
 
   REALM_ADMIN_TEMP="true"
-  if yesno "Realm" "Realm-Admin Passwort bei erstem Login ändern erzwingen (temporary)?"; then
+  if yesno "Realm" "Realm-Admin Passwort bei erstem Login aendern erzwingen?"; then
     REALM_ADMIN_TEMP="true"
   else
     REALM_ADMIN_TEMP="false"
@@ -396,29 +359,17 @@ fi
 ############################################
 HUB_SYSTEM_CLIENT_SECRET=""
 if [[ "$KC_MODE" == "external" ]]; then
-  msgbox "Warnung (Externer Keycloak)" \
-"Du musst im externen Keycloak manuell anlegen:\n\n\
-  - Realm:   ${REALM_NAME}\n\
-  - Clients: cryptomatorhub, cryptomator, ${HUB_SYSTEM_CLIENT_ID}\n\
-  - Protocol Mappers (Rollen im Token)\n\
-  - Client Secret für ${HUB_SYSTEM_CLIENT_ID}\n\n\
-Ohne korrekte Konfiguration: 401/403 und weisse Hub-UI."
-  HUB_SYSTEM_CLIENT_SECRET="$(passwordbox "External Keycloak" "Client Secret für ${HUB_SYSTEM_CLIENT_ID}:")" || exit 1
+  _MSG_EXT=$'Du musst im externen Keycloak manuell anlegen:\n\n  - Realm:   '"${REALM_NAME}"$'\n  - Clients: cryptomatorhub, cryptomator, '"${HUB_SYSTEM_CLIENT_ID}"$'\n  - Protocol Mappers (Rollen im Token)\n  - Client Secret fuer '"${HUB_SYSTEM_CLIENT_ID}"$'\n\nOhne korrekte Konfiguration: 401/403 und weisse Hub-UI.'
+  msgbox "Warnung (Externer Keycloak)" "$_MSG_EXT"
+  HUB_SYSTEM_CLIENT_SECRET="$(passwordbox "External Keycloak" "Client Secret fuer ${HUB_SYSTEM_CLIENT_ID}:")" || exit 1
   [[ -n "$HUB_SYSTEM_CLIENT_SECRET" ]] || die "Client Secret darf nicht leer sein (external keycloak)."
 fi
 
 ############################################
 # Zusammenfassung vor Installation          #
 ############################################
-yesno "Bestätigung" \
-"Folgende Konfiguration wird installiert:\n\n\
-  CTID:      ${CTID}\n\
-  Hostname:  ${HOSTNAME}\n\
-  Keycloak:  ${KC_MODE}\n\
-  Hub URL:   ${HUB_PUBLIC_BASE}\n\
-  KC URL:    ${KC_PUBLIC_BASE}\n\
-  Realm:     ${REALM_NAME:-cryptomator}\n\n\
-Fortfahren?" || { echo "Abgebrochen."; exit 0; }
+_MSG_CONFIRM=$'Folgende Konfiguration wird installiert:\n\n  CTID:      '"${CTID}"$'\n  Hostname:  '"${HOSTNAME}"$'\n  Keycloak:  '"${KC_MODE}"$'\n  Hub URL:   '"${HUB_PUBLIC_BASE}"$'\n  KC URL:    '"${KC_PUBLIC_BASE}"$'\n  Realm:     '"${REALM_NAME:-cryptomator}"$'\n\nFortfahren?'
+yesno "Bestaetigung" "$_MSG_CONFIRM" || { echo "Abgebrochen."; exit 0; }
 
 ############################################
 # Storage / Template                        #
@@ -432,55 +383,51 @@ ensure_template "$STORAGE" "$TEMPLATE"
 # LXC erstellen                             #
 ############################################
 if pct status "$CTID" >/dev/null 2>&1; then
-  die "CTID $CTID existiert bereits. Bitte einen freien CTID wählen oder den Container zuerst löschen."
+  die "CTID $CTID existiert bereits. Bitte einen freien CTID waehlen oder den Container zuerst loeschen."
 fi
 
-# Root-Passwort für Notfallzugang
 LXC_ROOT_PW="$(rand_hex 8)"
 
-# Netzwerk-Argumente als Array aufbauen
 if [[ "$NET_MODE" == "static" ]]; then
   NET0="name=eth0,bridge=${BRIDGE},ip=${STATIC_IP},gw=${STATIC_GW},type=veth"
   PCT_CREATE_ARGS=(
-    --hostname  "$HOSTNAME"
-    --cores     "$CORES"
-    --memory    "$RAM"
-    --swap      "$SWAP"
-    --rootfs    "${STORAGE}:${DISK}"
-    --net0      "$NET0"
-    --nameserver "$STATIC_DNS"
-    --features  "nesting=1,keyctl=1"
+    --hostname    "$HOSTNAME"
+    --cores       "$CORES"
+    --memory      "$RAM"
+    --swap        "$SWAP"
+    --rootfs      "${STORAGE}:${DISK}"
+    --net0        "$NET0"
+    --nameserver  "$STATIC_DNS"
+    --features    "nesting=1,keyctl=1"
     --unprivileged 1
-    --timezone  "$TZ"
-    --password  "$LXC_ROOT_PW"
-    --onboot    1
+    --timezone    "$TZ"
+    --password    "$LXC_ROOT_PW"
+    --onboot      1
   )
 else
   NET0="name=eth0,bridge=${BRIDGE},ip=dhcp,type=veth"
   PCT_CREATE_ARGS=(
-    --hostname  "$HOSTNAME"
-    --cores     "$CORES"
-    --memory    "$RAM"
-    --swap      "$SWAP"
-    --rootfs    "${STORAGE}:${DISK}"
-    --net0      "$NET0"
-    --features  "nesting=1,keyctl=1"
+    --hostname    "$HOSTNAME"
+    --cores       "$CORES"
+    --memory      "$RAM"
+    --swap        "$SWAP"
+    --rootfs      "${STORAGE}:${DISK}"
+    --net0        "$NET0"
+    --features    "nesting=1,keyctl=1"
     --unprivileged 1
-    --timezone  "$TZ"
-    --password  "$LXC_ROOT_PW"
-    --onboot    1
+    --timezone    "$TZ"
+    --password    "$LXC_ROOT_PW"
+    --onboot      1
   )
 fi
 
-# pct create direkt aufrufen (kein spinner_run wegen Array-Argument)
-spinner_start "LXC" "Erstelle Container ${CTID} (${HOSTNAME})…"
+spinner_start "LXC" "Erstelle Container ${CTID} (${HOSTNAME})..."
 pct create "$CTID" "${STORAGE}:vztmpl/${TEMPLATE}" "${PCT_CREATE_ARGS[@]}"
-spinner_stop
+_rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "pct create fehlgeschlagen."
 
 pct start "$CTID" || die "pct start fehlgeschlagen."
 
-# Warten bis Container bereit ist (bis zu 60 Sekunden)
-spinner_start "LXC" "Warte auf Container-Start…"
+spinner_start "LXC" "Warte auf Container-Start..."
 _ct_ready=0
 for _i in $(seq 1 30); do
   if pct exec "$CTID" -- true 2>/dev/null; then
@@ -490,7 +437,7 @@ for _i in $(seq 1 30); do
   sleep 2
 done
 spinner_stop
-[[ $_ct_ready -eq 1 ]] || die "Container antwortet nach 60s nicht. Prüfe: pct status $CTID"
+[[ $_ct_ready -eq 1 ]] || die "Container antwortet nach 60s nicht. Pruefe: pct status $CTID"
 
 ############################################
 # exec_ct – ab hier verfügbar              #
@@ -502,30 +449,22 @@ exec_ct() {
 ############################################
 # Bootstrap im Container                    #
 ############################################
-
-# DNS/Netz-Check
 if ! exec_ct "getent hosts deb.debian.org >/dev/null 2>&1"; then
-  msgbox "Netz/DNS Problem" \
-"Im Container kann 'deb.debian.org' nicht aufgelöst werden.\n\n\
-Das ist kein Script-Fehler, sondern ein DNS/Netzwerk-Problem im LXC.\n\n\
-Prüfen im Container (pct enter ${CTID}):\n\
-  - cat /etc/resolv.conf\n\
-  - ip r\n\
-  - ping 1.1.1.1\n\n\
-Container wird gestoppt. Problem beheben und Script erneut starten."
+  _MSG_DNS=$'Im Container kann deb.debian.org nicht aufgeloest werden.\n\nDas ist kein Script-Fehler, sondern ein DNS/Netzwerk-Problem im LXC.\n\nPruefen im Container (pct enter '"${CTID}"$'):\n  - cat /etc/resolv.conf\n  - ip r\n  - ping 1.1.1.1\n\nContainer wird gestoppt. Problem beheben und Script erneut starten.'
+  msgbox "Netz/DNS Problem" "$_MSG_DNS"
   pct stop "$CTID" || true
   exit 1
 fi
 
-spinner_start "Bootstrap" "apt-get update…"
+spinner_start "Bootstrap" "apt-get update..."
 exec_ct "apt-get update -y"
 _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "apt-get update fehlgeschlagen."
 
-spinner_start "Bootstrap" "Installiere Docker (ca. 1-2 Minuten)…"
+spinner_start "Bootstrap" "Installiere Docker (ca. 1-2 Minuten)..."
 exec_ct "apt-get install -y ca-certificates curl gnupg docker.io docker-compose-plugin"
 _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Installation fehlgeschlagen."
 
-spinner_start "Bootstrap" "Starte Docker Service…"
+spinner_start "Bootstrap" "Starte Docker Service..."
 exec_ct "systemctl enable --now docker"
 _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Service konnte nicht gestartet werden."
 
@@ -548,14 +487,10 @@ if [[ "$KC_MODE" == "internal" ]]; then
   HUB_SYSTEM_CLIENT_SECRET="$(rand_hex 24)"
 fi
 
-# CSP: connect-src muss KC-Domain erlauben, sonst weisse UI
 CSP="default-src 'self'; connect-src 'self' api.cryptomator.org ${KC_PUBLIC_BASE}; object-src 'none'; child-src 'self'; img-src * data:; frame-ancestors 'none'"
 
 ############################################
 # initdb.sql schreiben                      #
-# HINWEIS: Variablen werden VOR exec_ct    #
-# expandiert – korrekt so, da Host-Vars    #
-# in den Container geschrieben werden.     #
 ############################################
 exec_ct "cat > /opt/cryptomator-hub/data/db-init/initdb.sql <<'EOSQL'
 CREATE USER keycloak WITH ENCRYPTED PASSWORD '${KC_DB_PASSWORD}';
@@ -571,8 +506,8 @@ chmod 644 /opt/cryptomator-hub/data/db-init/initdb.sql" \
 
 ############################################
 # .env schreiben                            #
-# Variablen werden auf dem Host expandiert  #
-# und via tee in den Container geschrieben. #
+# Kein quoted Heredoc: Host-Vars werden    #
+# expandiert und in den Container gepipet. #
 ############################################
 KC_DB_PW_VALUE=""
 USE_EXTERNAL_VALUE="no"
@@ -582,8 +517,6 @@ else
   USE_EXTERNAL_VALUE="yes"
 fi
 
-# Wir schreiben die .env direkt mit printf, um Quoting-Probleme
-# mit Sonderzeichen in Passwörtern zu vermeiden.
 pct exec "$CTID" -- tee /opt/cryptomator-hub/.env > /dev/null <<ENV
 # Cryptomator Hub deployment (.env)
 # WICHTIG: Diese Datei enthaelt Secrets. Nicht in Git einchecken.
@@ -736,9 +669,8 @@ fi
 
 ############################################
 # compose.yml schreiben                     #
-# Dollar-Zeichen für docker-compose-Vars   #
-# müssen escaped werden (\$), damit sie    #
-# nicht durch die Shell expandiert werden. #
+# Single-quoted Heredoc: $ bleibt erhalten #
+# damit docker-compose die Vars liest.     #
 ############################################
 if [[ "$KC_MODE" == "internal" ]]; then
   pct exec "$CTID" -- tee /opt/cryptomator-hub/compose.yml > /dev/null <<'COMPOSE'
@@ -867,33 +799,22 @@ fi
 ############################################
 # Deploy                                     #
 ############################################
-spinner_start "Deploy" "Starte Docker Compose Stack (Images werden gepullt, kann einige Minuten dauern)…"
+spinner_start "Deploy" "Starte Docker Compose Stack (Images werden gepullt, kann einige Minuten dauern)..."
 exec_ct "cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml up -d"
-_deploy_rc=$?
-spinner_stop
-if [[ $_deploy_rc -ne 0 ]]; then
-  die "docker compose up fehlgeschlagen. Prüfe im Container: pct enter ${CTID} → cd /opt/cryptomator-hub && docker compose logs"
-fi
+_rc=$?; spinner_stop
+[[ $_rc -eq 0 ]] || die "docker compose up fehlgeschlagen. Pruefe: pct enter ${CTID} -> cd /opt/cryptomator-hub && docker compose logs"
 
 ############################################
 # Status-Check nach Deploy                   #
 ############################################
 sleep 5
-# docker compose ps --status running gibt nur laufende Container zurück
 RUNNING_COUNT="$(exec_ct \
   "docker compose -f /opt/cryptomator-hub/compose.yml ps --status running --quiet 2>/dev/null | wc -l" \
   2>/dev/null || echo "0")"
 
 if [[ "${RUNNING_COUNT:-0}" -eq 0 ]]; then
-  msgbox "Warnung" \
-"Docker Compose wurde gestartet, aber es konnten keine laufenden\n\
-Container bestätigt werden.\n\n\
-Keycloak braucht beim ersten Start bis zu 2 Minuten.\n\n\
-Prüfe manuell:\n\
-  pct enter ${CTID}\n\
-  cd /opt/cryptomator-hub\n\
-  docker compose ps\n\
-  docker compose logs --tail=50"
+  _MSG_WARN=$'Docker Compose wurde gestartet, aber es konnten keine laufenden\nContainer bestaetigt werden.\n\nKeycloak braucht beim ersten Start bis zu 2 Minuten.\n\nPruefe manuell:\n  pct enter '"${CTID}"$'\n  cd /opt/cryptomator-hub\n  docker compose ps\n  docker compose logs --tail=50'
+  msgbox "Warnung" "$_MSG_WARN"
 fi
 
 ############################################
@@ -905,43 +826,11 @@ LXC_IP="$(get_lxc_ip "$CTID")"
 # Abschluss-Zusammenfassung                 #
 ############################################
 if [[ "$KC_MODE" == "internal" ]]; then
-  msgbox "Fertig – Installation abgeschlossen" \
-"LXC: ${CTID}  |  Hostname: ${HOSTNAME}\n\
-LXC IP: ${LXC_IP}\n\
-\n\
-Hub:\n\
-  Intern:  http://${LXC_IP}:${HUB_BIND_PORT}\n\
-  Public:  ${HUB_PUBLIC_BASE}\n\
-\n\
-Keycloak:\n\
-  Intern:  http://${LXC_IP}:${KC_BIND_PORT}\n\
-  Public:  ${KC_PUBLIC_BASE}\n\
-  Realm:   ${REALM_NAME}\n\
-  Admin:   ${REALM_ADMIN_USER}  (Passwort wie eingegeben)\n\
-\n\
-LXC root Passwort (Notfall): ${LXC_ROOT_PW}\n\
-\n\
-Hinweise:\n\
-  - Keycloak braucht beim 1. Start bis zu 2 Minuten.\n\
-  - Kein /kc Pfad – direkt ueber Root-Pfad erreichbar.\n\
-  - Reverse Proxy: Hub/Keycloak ueber unterschied. Ports/Domains."
+  _MSG_DONE=$'LXC: '"${CTID}"'  |  Hostname: '"${HOSTNAME}"$'\nLXC IP: '"${LXC_IP}"$'\n\nHub:\n  Intern:  http://'"${LXC_IP}"':'"${HUB_BIND_PORT}"$'\n  Public:  '"${HUB_PUBLIC_BASE}"$'\n\nKeycloak:\n  Intern:  http://'"${LXC_IP}"':'"${KC_BIND_PORT}"$'\n  Public:  '"${KC_PUBLIC_BASE}"$'\n  Realm:   '"${REALM_NAME}"$'\n  Admin:   '"${REALM_ADMIN_USER}"$'  (Passwort wie eingegeben)\n\nLXC root Passwort (Notfall): '"${LXC_ROOT_PW}"$'\n\nHinweise:\n  - Keycloak braucht beim 1. Start bis zu 2 Minuten.\n  - Kein /kc Pfad - direkt ueber Root-Pfad erreichbar.\n  - Reverse Proxy: Hub/Keycloak ueber unterschiedliche Ports/Domains.'
+  msgbox "Installation abgeschlossen" "$_MSG_DONE"
 else
-  msgbox "Fertig – Installation abgeschlossen" \
-"LXC: ${CTID}  |  Hostname: ${HOSTNAME}\n\
-LXC IP: ${LXC_IP}\n\
-\n\
-Hub:\n\
-  Intern:  http://${LXC_IP}:${HUB_BIND_PORT}\n\
-  Public:  ${HUB_PUBLIC_BASE}\n\
-\n\
-Keycloak (extern): ${KC_PUBLIC_BASE}\n\
-  Realm: ${REALM_NAME}\n\
-\n\
-LXC root Passwort (Notfall): ${LXC_ROOT_PW}\n\
-\n\
-Wichtig:\n\
-  - Realm/Clients/Mapper/Secrets im externen Keycloak\n\
-    korrekt konfigurieren – sonst 401/403 und weisse UI."
+  _MSG_DONE=$'LXC: '"${CTID}"'  |  Hostname: '"${HOSTNAME}"$'\nLXC IP: '"${LXC_IP}"$'\n\nHub:\n  Intern:  http://'"${LXC_IP}"':'"${HUB_BIND_PORT}"$'\n  Public:  '"${HUB_PUBLIC_BASE}"$'\n\nKeycloak (extern): '"${KC_PUBLIC_BASE}"$'\n  Realm: '"${REALM_NAME}"$'\n\nLXC root Passwort (Notfall): '"${LXC_ROOT_PW}"$'\n\nWichtig:\n  - Realm/Clients/Mapper/Secrets im externen Keycloak\n    korrekt konfigurieren - sonst 401/403 und weisse UI.'
+  msgbox "Installation abgeschlossen" "$_MSG_DONE"
 fi
 
 echo "Done. LXC IP: ${LXC_IP}"
