@@ -84,33 +84,23 @@ menulist() {
   whiptail --title "$title" --menu "$prompt" "$height" "$width" "$listheight" "$@" 3>&1 1>&2 2>&3
 }
 
-# Spinner: FIFO-basiert, läuft in aktueller Shell damit exec_ct erreichbar bleibt.
+# Statusanzeige: whiptail --infobox (kein Input, kein FIFO, kein Hintergrundprozess).
+# Zeigt eine nicht-blockierende Nachricht. Vollstaendig deadlock-frei.
+# Output langer Befehle wird in Logdatei umgeleitet.
+_INSTALL_LOG="/tmp/cryptomator-hub-install.log"
+
+infobox() {
+  whiptail --title "${1:-Info}" --infobox "${2:-}" 8 78
+}
+
+# spinner_start zeigt infobox VOR dem Befehl.
+# spinner_stop raeut auf (hier nichts zu tun).
 spinner_start() {
-  local title="$1" msg="$2"
-  _SPINNER_FIFO="$(mktemp -u /tmp/spinner_XXXXXX)"
-  mkfifo "$_SPINNER_FIFO"
-  whiptail --title "$title" --gauge "$msg" 8 78 0 < "$_SPINNER_FIFO" &
-  _SPINNER_PID=$!
-  exec 9>"$_SPINNER_FIFO"
-  # Animationsloop in Subshell – kein 'local', da außerhalb einer Funktion
-  (
-    s=0
-    while kill -0 "$_SPINNER_PID" 2>/dev/null; do
-      echo "$s" >&9
-      s=$(( (s + 4) % 99 ))
-      sleep 0.3
-    done
-  ) &
-  _SPINNER_ANIM_PID=$!
+  infobox "${1:-}" "${2:-}"
 }
 
 spinner_stop() {
-  echo "100" >&9 2>/dev/null || true
-  exec 9>&- 2>/dev/null || true
-  kill "$_SPINNER_ANIM_PID" 2>/dev/null || true
-  wait "$_SPINNER_PID"      2>/dev/null || true
-  wait "$_SPINNER_ANIM_PID" 2>/dev/null || true
-  rm -f "$_SPINNER_FIFO"    2>/dev/null || true
+  true
 }
 
 is_int()   { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
@@ -168,10 +158,10 @@ ensure_template() {
     msg=$'Debian Template nicht lokal vorhanden.\n\nLade herunter:\n'"${tmpl}"$'\n\nStorage: '"${storage}"$'\n\nDies kann einige Minuten dauern...'
     msgbox "Template Download" "$msg"
     spinner_start "Template Download" "Lade ${tmpl}..."
-    pveam download "$storage" "$tmpl"
+    pveam download "$storage" "$tmpl" >>"$_INSTALL_LOG" 2>&1
     local rc=$?
     spinner_stop
-    [[ $rc -eq 0 ]] || die "Template Download fehlgeschlagen."
+    [[ $rc -eq 0 ]] || die "Template Download fehlgeschlagen. Log: $_INSTALL_LOG"
   fi
 }
 
@@ -422,8 +412,8 @@ else
 fi
 
 spinner_start "LXC" "Erstelle Container ${CTID} (${HOSTNAME})..."
-pct create "$CTID" "${STORAGE}:vztmpl/${TEMPLATE}" "${PCT_CREATE_ARGS[@]}"
-_rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "pct create fehlgeschlagen."
+pct create "$CTID" "${STORAGE}:vztmpl/${TEMPLATE}" "${PCT_CREATE_ARGS[@]}" >>"$_INSTALL_LOG" 2>&1
+_rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "pct create fehlgeschlagen. Log: $_INSTALL_LOG"
 
 pct start "$CTID" || die "pct start fehlgeschlagen."
 
@@ -457,16 +447,16 @@ if ! exec_ct "getent hosts deb.debian.org >/dev/null 2>&1"; then
 fi
 
 spinner_start "Bootstrap" "apt-get update..."
-exec_ct "apt-get update -y"
-_rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "apt-get update fehlgeschlagen."
+exec_ct "apt-get update -y" >>"$_INSTALL_LOG" 2>&1
+_rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "apt-get update fehlgeschlagen. Log: $_INSTALL_LOG"
 
 spinner_start "Bootstrap" "Installiere Docker (ca. 1-2 Minuten)..."
-exec_ct "apt-get install -y ca-certificates curl gnupg docker.io docker-compose-plugin"
-_rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Installation fehlgeschlagen."
+exec_ct "apt-get install -y ca-certificates curl gnupg docker.io docker-compose-plugin" >>"$_INSTALL_LOG" 2>&1
+_rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Installation fehlgeschlagen. Log: $_INSTALL_LOG"
 
 spinner_start "Bootstrap" "Starte Docker Service..."
-exec_ct "systemctl enable --now docker"
-_rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Service konnte nicht gestartet werden."
+exec_ct "systemctl enable --now docker" >>"$_INSTALL_LOG" 2>&1
+_rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Service konnte nicht gestartet werden. Log: $_INSTALL_LOG"
 
 ############################################
 # Deployment-Verzeichnisse anlegen          #
@@ -800,7 +790,7 @@ fi
 # Deploy                                     #
 ############################################
 spinner_start "Deploy" "Starte Docker Compose Stack (Images werden gepullt, kann einige Minuten dauern)..."
-exec_ct "cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml up -d"
+exec_ct "cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml up -d" >>"$_INSTALL_LOG" 2>&1
 _rc=$?; spinner_stop
 [[ $_rc -eq 0 ]] || die "docker compose up fehlgeschlagen. Pruefe: pct enter ${CTID} -> cd /opt/cryptomator-hub && docker compose logs"
 
