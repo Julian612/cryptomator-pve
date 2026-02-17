@@ -501,7 +501,8 @@ spinner_stop
 exec_ct() {
   # lxc-attach statt pct exec: zuverlaessiger bei langen Befehlen,
   # kein internes TTY-Allokieren. </dev/null verhindert stdin-Blockaden.
-  lxc-attach -n "$CTID" -- bash -c "$1" </dev/null
+  # TERM=dumb unterdrueckt Terminal-Escape-Codes, die das whiptail-Display stoeren.
+  lxc-attach -n "$CTID" -- env TERM=dumb DEBIAN_FRONTEND=noninteractive bash -c "$1" </dev/null
 }
 
 # write_ct_file – schreibt Datei via base64 in den Container.
@@ -526,11 +527,11 @@ sleep 20
 spinner_stop
 
 spinner_start "Bootstrap" "apt-get update..."
-exec_ct "DEBIAN_FRONTEND=noninteractive apt-get update -y" >>"$_INSTALL_LOG" 2>&1
+exec_ct "apt-get update -y" >>"$_INSTALL_LOG" 2>&1
 _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "apt-get update fehlgeschlagen. Log: $_INSTALL_LOG"
 
 spinner_start "Bootstrap" "Installiere Docker (ca. 1-2 Minuten)..."
-exec_ct "DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg docker.io docker-compose-plugin" >>"$_INSTALL_LOG" 2>&1
+exec_ct "apt-get install -y ca-certificates curl gnupg docker.io docker-compose-plugin" >>"$_INSTALL_LOG" 2>&1
 _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Installation fehlgeschlagen. Log: $_INSTALL_LOG"
 
 spinner_start "Bootstrap" "Starte Docker Service..."
@@ -561,7 +562,7 @@ CSP="default-src 'self'; connect-src 'self' api.cryptomator.org ${KC_PUBLIC_BASE
 ############################################
 # initdb.sql schreiben                      #
 ############################################
-exec_ct "cat > /opt/cryptomator-hub/data/db-init/initdb.sql <<'EOSQL'
+write_ct_file /opt/cryptomator-hub/data/db-init/initdb.sql <<EOSQL
 CREATE USER keycloak WITH ENCRYPTED PASSWORD '${KC_DB_PASSWORD}';
 CREATE DATABASE keycloak WITH ENCODING 'UTF8';
 GRANT ALL PRIVILEGES ON DATABASE keycloak TO keycloak;
@@ -570,8 +571,7 @@ CREATE USER hub WITH ENCRYPTED PASSWORD '${HUB_DB_PASSWORD}';
 CREATE DATABASE hub WITH ENCODING 'UTF8';
 GRANT ALL PRIVILEGES ON DATABASE hub TO hub;
 EOSQL
-chmod 644 /opt/cryptomator-hub/data/db-init/initdb.sql" \
-  || die "initdb.sql konnte nicht geschrieben werden."
+[[ $? -eq 0 ]] || die "initdb.sql konnte nicht geschrieben werden."
 
 ############################################
 # .env schreiben                            #
