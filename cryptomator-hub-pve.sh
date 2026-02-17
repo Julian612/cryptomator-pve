@@ -458,6 +458,9 @@ if [[ "$NET_MODE" == "static" ]]; then
   )
 else
   NET0="name=eth0,bridge=${BRIDGE},ip=dhcp,type=veth"
+  # DNS vom PVE-Host uebernehmen damit der Container nach dem Start sofort
+  # Namen aufloesen kann (DHCP liefert DNS manchmal zu spaet oder gar nicht)
+  _HOST_DNS="$(grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' || echo "1.1.1.1")"
   PCT_CREATE_ARGS=(
     --hostname    "$HOSTNAME"
     --cores       "$CORES"
@@ -465,6 +468,7 @@ else
     --swap        "$SWAP"
     --rootfs      "${ROOTFS_STORAGE}:${DISK}"
     --net0        "$NET0"
+    --nameserver  "$_HOST_DNS"
     --features    "nesting=1,keyctl=1"
     --unprivileged 1
     --timezone    "$TZ"
@@ -501,12 +505,50 @@ exec_ct() {
 ############################################
 # Bootstrap im Container                    #
 ############################################
-if ! exec_ct "getent hosts deb.debian.org >/dev/null 2>&1"; then
-  _MSG_DNS=$'Im Container kann deb.debian.org nicht aufgeloest werden.\n\nDas ist kein Script-Fehler, sondern ein DNS/Netzwerk-Problem im LXC.\n\nPruefen im Container (pct enter '"${CTID}"$'):\n  - cat /etc/resolv.conf\n  - ip r\n  - ping 1.1.1.1\n\nContainer wird gestoppt. Problem beheben und Script erneut starten.'
+# Warten bis Netzwerk im Container bereit ist (DHCP braucht einige Sekunden)
+spinner_start "Netzwerk" "Warte auf Netzwerk im Container..."
+_net_ready=0
+for _i in $(seq 1 15); do
+  if exec_ct "ip route show default 2>/dev/null | grep -q default" 2>/dev/null; then
+    _net_ready=1
+    break
+  fi
+  sleep 2
+done
+spinner_stop
+
+# DNS-Check mit Retry (5 Versuche, je 3 Sekunden Abstand)
+_dns_ok=0
+for _i in $(seq 1 5); do
+  if exec_ct "getent hosts deb.debian.org >/dev/null 2>&1" 2>/dev/null; then
+    _dns_ok=1
+    break
+  fi
+  sleep 3
+done
+
+if [[ $_dns_ok -eq 0 ]]; then
+  _ct_resolv="$(pct exec "$CTID" -- cat /etc/resolv.conf 2>/dev/null || echo "nicht lesbar")"
+  _ct_route="$(pct exec "$CTID" -- ip route 2>/dev/null || echo "nicht lesbar")"
+  _MSG_DNS=$'DNS-Aufloesung im Container fehlgeschlagen.
+
+/etc/resolv.conf im Container:
+'
+  _MSG_DNS+="$_ct_resolv"
+  _MSG_DNS+=$'
+
+Routen:
+'
+  _MSG_DNS+="$_ct_route"
+  _MSG_DNS+=$'
+
+Container wird gestoppt.
+Pruefe Bridge und DNS-Konfiguration.'
   msgbox "Netz/DNS Problem" "$_MSG_DNS"
   pct stop "$CTID" || true
   exit 1
 fi
+
 
 spinner_start "Bootstrap" "apt-get update..."
 exec_ct "apt-get update -y" >>"$_INSTALL_LOG" 2>&1
