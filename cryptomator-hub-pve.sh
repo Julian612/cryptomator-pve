@@ -235,7 +235,7 @@ next_free_ctid() {
 get_lxc_ip() {
   local ctid="$1" ip="" attempts=0
   while [[ -z "$ip" && $attempts -lt 20 ]]; do
-    ip="$(pct exec "$ctid" -- hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    ip="$(lxc-attach -n "$ctid" -- hostname -I </dev/null 2>/dev/null | awk '{print $1}' || true)"
     [[ -n "$ip" ]] && break
     sleep 2
     attempts=$(( attempts + 1 ))
@@ -486,7 +486,7 @@ pct start "$CTID" || die "pct start fehlgeschlagen."
 spinner_start "LXC" "Warte auf Container-Start..."
 _ct_ready=0
 for _i in $(seq 1 30); do
-  if pct exec "$CTID" -- true 2>/dev/null; then
+  if lxc-attach -n "$CTID" -- true </dev/null >/dev/null 2>/dev/null; then
     _ct_ready=1
     break
   fi
@@ -499,7 +499,26 @@ spinner_stop
 # exec_ct – ab hier verfügbar              #
 ############################################
 exec_ct() {
-  pct exec "$CTID" -- bash -lc "$1"
+  # lxc-attach statt pct exec: zuverlaessiger bei langen Befehlen,
+  # kein internes TTY-Allokieren. </dev/null verhindert stdin-Blockaden.
+  # TERM=dumb + NO_COLOR unterdrueckt Terminal-Escape-Codes.
+  # stderr -> Logdatei: lxc-attach gibt eigene Meldungen auf stderr aus
+  # (cgroup-Warnungen, Namespace-Infos etc.), die das whiptail-Display stoeren.
+  lxc-attach -n "$CTID" -- env TERM=dumb DEBIAN_FRONTEND=noninteractive NO_COLOR=1 \
+    bash -c "$1" </dev/null 2>>"$_INSTALL_LOG"
+}
+
+# write_ct_file – schreibt Datei via base64 in den Container.
+# Vermeidet stdin-Piping durch pct exec (haengt bei manchen PVE-Versionen).
+# Usage: write_ct_file /ziel/pfad [mode] <<'MARKER'
+#        Inhalt
+#        MARKER
+write_ct_file() {
+  local dest="$1" mode="${2:-0644}"
+  local b64
+  b64="$(base64 -w0)"
+  # stdout auch ins Log: verhindert dass stray-Output von lxc-attach das Display stoert
+  exec_ct "printf '%s' '${b64}' | base64 -d > '${dest}' && chmod ${mode} '${dest}'" >>"$_INSTALL_LOG"
 }
 
 ############################################
@@ -529,7 +548,7 @@ _rc=$?; spinner_stop; [[ $_rc -eq 0 ]] || die "Docker Service konnte nicht gesta
 exec_ct "mkdir -p \
   /opt/cryptomator-hub/data/db-init \
   /opt/cryptomator-hub/data/db-data \
-  /opt/cryptomator-hub/kc-import" \
+  /opt/cryptomator-hub/kc-import" >>"$_INSTALL_LOG" \
   || die "Verzeichnisse konnten nicht angelegt werden."
 
 ############################################
@@ -547,7 +566,7 @@ CSP="default-src 'self'; connect-src 'self' api.cryptomator.org ${KC_PUBLIC_BASE
 ############################################
 # initdb.sql schreiben                      #
 ############################################
-exec_ct "cat > /opt/cryptomator-hub/data/db-init/initdb.sql <<'EOSQL'
+write_ct_file /opt/cryptomator-hub/data/db-init/initdb.sql <<EOSQL
 CREATE USER keycloak WITH ENCRYPTED PASSWORD '${KC_DB_PASSWORD}';
 CREATE DATABASE keycloak WITH ENCODING 'UTF8';
 GRANT ALL PRIVILEGES ON DATABASE keycloak TO keycloak;
@@ -556,8 +575,7 @@ CREATE USER hub WITH ENCRYPTED PASSWORD '${HUB_DB_PASSWORD}';
 CREATE DATABASE hub WITH ENCODING 'UTF8';
 GRANT ALL PRIVILEGES ON DATABASE hub TO hub;
 EOSQL
-chmod 644 /opt/cryptomator-hub/data/db-init/initdb.sql" \
-  || die "initdb.sql konnte nicht geschrieben werden."
+[[ $? -eq 0 ]] || die "initdb.sql konnte nicht geschrieben werden."
 
 ############################################
 # .env schreiben                            #
@@ -572,7 +590,8 @@ else
   USE_EXTERNAL_VALUE="yes"
 fi
 
-pct exec "$CTID" -- tee /opt/cryptomator-hub/.env > /dev/null <<ENV
+spinner_start "Konfiguration" "Schreibe .env..."
+write_ct_file /opt/cryptomator-hub/.env 0600 <<ENV
 # Cryptomator Hub deployment (.env)
 # WICHTIG: Diese Datei enthaelt Secrets. Nicht in Git einchecken.
 
@@ -611,12 +630,14 @@ REALM_ADMIN_TEMPORARY=${REALM_ADMIN_TEMP}
 QUARKUS_HTTP_HEADER__CONTENT_SECURITY_POLICY__VALUE=${CSP}
 ENV
 [[ $? -eq 0 ]] || die ".env konnte nicht geschrieben werden."
+spinner_stop
 
 ############################################
 # realm.json (nur interner Keycloak)        #
 ############################################
 if [[ "$KC_MODE" == "internal" ]]; then
-  pct exec "$CTID" -- tee /opt/cryptomator-hub/kc-import/realm.json > /dev/null <<REALM
+  spinner_start "Konfiguration" "Schreibe realm.json..."
+  write_ct_file /opt/cryptomator-hub/kc-import/realm.json <<REALM
 {
   "id": "cryptomator",
   "realm": "${REALM_NAME}",
@@ -720,6 +741,7 @@ if [[ "$KC_MODE" == "internal" ]]; then
 }
 REALM
   [[ $? -eq 0 ]] || die "realm.json konnte nicht geschrieben werden."
+  spinner_stop
 fi
 
 ############################################
@@ -727,8 +749,9 @@ fi
 # Single-quoted Heredoc: $ bleibt erhalten #
 # damit docker-compose die Vars liest.     #
 ############################################
+spinner_start "Konfiguration" "Schreibe compose.yml..."
 if [[ "$KC_MODE" == "internal" ]]; then
-  pct exec "$CTID" -- tee /opt/cryptomator-hub/compose.yml > /dev/null <<'COMPOSE'
+  write_ct_file /opt/cryptomator-hub/compose.yml <<'COMPOSE'
 services:
   postgres:
     image: ${POSTGRES_IMAGE}
@@ -805,7 +828,7 @@ COMPOSE
 
 else
 
-  pct exec "$CTID" -- tee /opt/cryptomator-hub/compose.yml > /dev/null <<'COMPOSE'
+  write_ct_file /opt/cryptomator-hub/compose.yml <<'COMPOSE'
 services:
   postgres:
     image: ${POSTGRES_IMAGE}
@@ -850,11 +873,17 @@ services:
 COMPOSE
   [[ $? -eq 0 ]] || die "compose.yml (extern) konnte nicht geschrieben werden."
 fi
+spinner_stop
 
 ############################################
 # Deploy                                     #
 ############################################
-spinner_start "Deploy" "Starte Docker Compose Stack (Images werden gepullt, kann einige Minuten dauern)..."
+spinner_start "Deploy" "Lade Docker Images (kann einige Minuten dauern)..."
+exec_ct "cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml pull" >>"$_INSTALL_LOG" 2>&1
+_rc=$?; spinner_stop
+[[ $_rc -eq 0 ]] || die "docker compose pull fehlgeschlagen. Log: $_INSTALL_LOG"
+
+spinner_start "Deploy" "Starte Container (Keycloak braucht beim ersten Start bis zu 2-3 Minuten)..."
 exec_ct "cd /opt/cryptomator-hub && docker compose --env-file .env -f compose.yml up -d" >>"$_INSTALL_LOG" 2>&1
 _rc=$?; spinner_stop
 [[ $_rc -eq 0 ]] || die "docker compose up fehlgeschlagen. Pruefe: pct enter ${CTID} -> cd /opt/cryptomator-hub && docker compose logs"
@@ -862,20 +891,33 @@ _rc=$?; spinner_stop
 ############################################
 # Status-Check nach Deploy                   #
 ############################################
-sleep 5
+spinner_start "Status" "Warte auf Container-Start (ca. 10s)..."
+sleep 10
+spinner_stop
+
+spinner_start "Status" "Pruefe laufende Container..."
 RUNNING_COUNT="$(exec_ct \
   "docker compose -f /opt/cryptomator-hub/compose.yml ps --status running --quiet 2>/dev/null | wc -l" \
-  2>/dev/null || echo "0")"
+  || echo "0")"
+spinner_stop
 
-if [[ "${RUNNING_COUNT:-0}" -eq 0 ]]; then
-  _MSG_WARN=$'Docker Compose wurde gestartet, aber es konnten keine laufenden\nContainer bestaetigt werden.\n\nKeycloak braucht beim ersten Start bis zu 2 Minuten.\n\nPruefe manuell:\n  pct enter '"${CTID}"$'\n  cd /opt/cryptomator-hub\n  docker compose ps\n  docker compose logs --tail=50'
+if [[ "$KC_MODE" == "internal" ]]; then
+  _expected=3
+else
+  _expected=2
+fi
+
+if [[ "${RUNNING_COUNT:-0}" -lt "$_expected" ]]; then
+  _MSG_WARN=$'Docker Compose wurde gestartet, aber nicht alle Container laufen.\n('"${RUNNING_COUNT:-0}"' von '"${_expected}"$' erwartet)\n\nKeycloak braucht beim ersten Start bis zu 2-3 Minuten.\n\nPruefe manuell:\n  pct enter '"${CTID}"$'\n  cd /opt/cryptomator-hub\n  docker compose ps\n  docker compose logs --tail=50'
   msgbox "Warnung" "$_MSG_WARN"
 fi
 
 ############################################
 # LXC-IP ermitteln                          #
 ############################################
+spinner_start "Netzwerk" "Ermittle LXC IP-Adresse..."
 LXC_IP="$(get_lxc_ip "$CTID")"
+spinner_stop
 
 ############################################
 # Abschluss-Zusammenfassung                 #
